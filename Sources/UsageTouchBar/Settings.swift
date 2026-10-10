@@ -484,6 +484,8 @@ final class DisplaySettingsViewController: NSViewController {
     private let providerStack = NSStackView()
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let diagnosticsLabel = NSTextField(wrappingLabelWithString: "")
+    private let claudeStatusLabel = NSTextField(wrappingLabelWithString: "")
+    private let estimateSwitch = NSSwitch()
     private let addFrontAppButton = NSButton(title: "把它加入音乐 App 列表", target: nil, action: nil)
     /// 三栏设置；按窗口宽度组合成 3 栏 / 2 栏 / 1 栏
     private var grids: [NSGridView] = []
@@ -647,6 +649,9 @@ final class DisplaySettingsViewController: NSViewController {
             .item("百分比数字颜色：", percentColorWell),
             .item("套餐、倒计时颜色：", detailColorWell),
             .item("", resetColors),
+            .section("读取状态"),
+            .full(claudeStatusLabel),
+            .item("取不到时显示本地估算：", estimateSwitch),
             .section("其他"),
             .item("刷新间隔：", intervalPopup),
             .item("菜单栏显示用量文字：", menuBarSwitch),
@@ -679,6 +684,8 @@ final class DisplaySettingsViewController: NSViewController {
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = "修改后立即生效，保存在 ~/.config/usage-touchbar/config.json。"
 
+        claudeStatusLabel.font = .systemFont(ofSize: 12)
+        claudeStatusLabel.preferredMaxLayoutWidth = 380
         diagnosticsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         diagnosticsLabel.preferredMaxLayoutWidth = 300
         addFrontAppButton.target = self
@@ -771,7 +778,7 @@ final class DisplaySettingsViewController: NSViewController {
             gridRow.rowAlignment = .none
             if sectionRows.contains(index) && index > 0 { gridRow.topPadding = 10 }
         }
-        for control in [resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, loginSwitch,
+        for control in [resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, loginSwitch, estimateSwitch,
                         nameColorWell, percentColorWell, detailColorWell] as [NSView] {
             if let cell = grid.cell(for: control) {
                 cell.yPlacement = .center
@@ -819,7 +826,8 @@ final class DisplaySettingsViewController: NSViewController {
                         warnPopup, dangerPopup, intervalPopup, musicModePopup,
                         fontSizeControl, iconSizeControl,
                         nameColorWell, percentColorWell, detailColorWell, customMusicField,
-                        resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, slotPopup] as [NSControl] {
+                        resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, slotPopup,
+                        estimateSwitch] as [NSControl] {
             control.target = self
             control.action = #selector(valueChanged(_:))
         }
@@ -861,6 +869,7 @@ final class DisplaySettingsViewController: NSViewController {
         buttonsSwitch.state = (config.showTouchBarButtons ?? true) ? .on : .off
         menuBarSwitch.state = config.resolvedShowMenuBar ? .on : .off
         dockSwitch.state = config.resolvedShowInDock ? .on : .off
+        estimateSwitch.state = config.claudeOfflineEstimate == true ? .on : .off
         slotPopup.selectItem(at: StripSlotPolicy.allCases.firstIndex(of: config.resolvedStripSlotPolicy) ?? 0)
         loginSwitch.state = LaunchAtLogin.isEnabled ? .on : .off
         updateMusicControlsEnabled()
@@ -870,6 +879,13 @@ final class DisplaySettingsViewController: NSViewController {
     }
 
     private func updateDiagnostics() {
+        if let status = ClaudeUsageCollector.lastStatus() {
+            claudeStatusLabel.stringValue = (status.ok ? "✓ Claude 实时用量：" : "✗ Claude 实时用量：") + status.detail
+            claudeStatusLabel.textColor = status.ok ? .secondaryLabelColor : .systemOrange
+        } else {
+            claudeStatusLabel.stringValue = "Claude 实时用量：还没有读取过（点 Touch Bar 上的刷新按钮可立即读取）。"
+            claudeStatusLabel.textColor = .secondaryLabelColor
+        }
         let name = Diagnostics.lastAppName ?? "（还没有切换过 App）"
         let id = Diagnostics.lastAppBundleID ?? "—"
         let recognized = Diagnostics.lastAppBundleID == nil ? "" : (Diagnostics.lastAppIsMusic ? "✓ 已识别为音乐 App" : "✗ 不在音乐 App 列表里")
@@ -1025,6 +1041,7 @@ final class DisplaySettingsViewController: NSViewController {
         config.showTouchBarButtons = buttonsSwitch.state == .on
         config.showMenuBar = menuBarSwitch.state == .on
         config.showInDock = dockSwitch.state == .on
+        config.claudeOfflineEstimate = estimateSwitch.state == .on
         config.stripSlotPolicy = StripSlotPolicy.allCases[max(0, slotPopup.indexOfSelectedItem)].rawValue
         updateMusicControlsEnabled()
 

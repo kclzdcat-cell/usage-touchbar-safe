@@ -740,6 +740,7 @@ struct AppConfig: Codable {
     var showMenuBar: Bool?
     var showInDock: Bool?
     var stripSlotPolicy: String?      // StripSlotPolicy.rawValue
+    var claudeOfflineEstimate: Bool?  // 取不到实时数据时是否显示本地估算（默认不显示）
     var fontSize: String?             // FontSizeOption.rawValue
     var iconSize: String?             // IconSizeOption.rawValue
     var nameColor: String?            // "#RRGGBB"，服务名称
@@ -927,6 +928,36 @@ struct ClaudeUsageCollector: UsageCollecting {
     private nonisolated(unsafe) static var liveCacheAt: Date?
     private static let liveMinInterval: TimeInterval = 5 * 60
 
+    /// 最近一次实时读取的结果，给设置窗口的诊断栏和 Touch Bar 显示失败原因用。
+    struct LiveStatus: Sendable {
+        let ok: Bool
+        /// Touch Bar 上显示的简短原因
+        let short: String
+        /// 设置窗口里显示的详细说明
+        let detail: String
+        let at: Date
+    }
+    private nonisolated(unsafe) static var status: LiveStatus?
+
+    static func lastStatus() -> LiveStatus? {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        return status
+    }
+
+    /// 点刷新按钮时允许立刻重试（比如刚在终端重新登录过）。
+    static func clearFailure() {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        if status?.ok == false { status = nil }
+    }
+
+    private static func record(ok: Bool, short: String, detail: String) {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        status = LiveStatus(ok: ok, short: short, detail: detail, at: Date())
+    }
+
     private static func freshLiveSnapshot() -> UsageSnapshot? {
         liveCacheLock.lock()
         defer { liveCacheLock.unlock() }
@@ -956,6 +987,7 @@ struct ClaudeUsageCollector: UsageCollecting {
         defer { liveCacheLock.unlock() }
         liveCache = nil
         liveCacheAt = nil
+        status = nil
     }
 
     func collect() async -> UsageSnapshot {
@@ -968,8 +1000,17 @@ struct ClaudeUsageCollector: UsageCollecting {
             return cached
         }
 
+        // 刚失败过就先别重试：失败后每次刷新都去请求，会一直被限流
+        let backoff: TimeInterval
+        if let status = Self.lastStatus(), !status.ok {
+            backoff = status.short == "被限流" ? 5 * 60 : 60
+        } else {
+            backoff = 0
+        }
+        let recentlyFailed = Self.lastStatus().map { !$0.ok && Date().timeIntervalSince($0.at) < backoff } ?? false
+
         // Time to refresh: fetch the real numbers from the live endpoint.
-        if let live = await liveSnapshot() {
+        if !recentlyFailed, let live = await liveSnapshot() {
             Self.storeLiveSnapshot(live)
             return live
         }
@@ -979,13 +1020,26 @@ struct ClaudeUsageCollector: UsageCollecting {
         if let stale = Self.lastLiveSnapshot() {
             return stale
         }
-        return estimatedSnapshot()
+        // 没有任何实时数据：默认直接显示失败原因，而不是和真实用量差很多的本地估算
+        if AppConfig.shared.claudeOfflineEstimate == true {
+            return estimatedSnapshot()
+        }
+        return .failure(.claude, message: Self.lastStatus()?.short ?? "读取失败")
     }
 
     // MARK: - Live API
 
     private func liveSnapshot() async -> UsageSnapshot? {
-        guard let credentials = ClaudeCredentials.current() else { return nil }
+        guard let credentials = ClaudeCredentials.current() else {
+            Self.record(ok: false, short: "读不到登录",
+                        detail: "读不到 Claude Code 的登录信息。可能是钥匙串授权被拒绝（重新打开 App，弹窗时点「允许」），或者 Claude Code 还没登录（在终端运行 claude 登录一次）。")
+            return nil
+        }
+        if let expiry = credentials.expiryDate, expiry < Date() {
+            Self.record(ok: false, short: "登录过期",
+                        detail: "Claude Code 的登录已于 \(Self.timeText(expiry)) 过期。它只在 Claude Code 运行时自动续期：在终端运行一次 claude，过一会儿这里就会恢复。")
+            return nil
+        }
 
         var request = URLRequest(url: Self.usageURL)
         request.timeoutInterval = 8
@@ -996,11 +1050,41 @@ struct ClaudeUsageCollector: UsageCollecting {
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        guard let (data, response) = try? await SafeNet.data(for: request),
-              let http = response as? HTTPURLResponse, http.statusCode == 200,
-              let usage = try? JSONDecoder().decode(LiveUsage.self, from: data) else {
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await SafeNet.data(for: request)
+        } catch {
+            Self.record(ok: false, short: "网络错误", detail: "连接 api.anthropic.com 失败：\(error.localizedDescription)")
             return nil
         }
+        guard let http = response as? HTTPURLResponse else {
+            Self.record(ok: false, short: "网络错误", detail: "没有收到有效的响应。")
+            return nil
+        }
+        switch http.statusCode {
+        case 200:
+            break
+        case 401, 403:
+            Self.record(ok: false, short: "登录过期",
+                        detail: "Anthropic 拒绝了这个登录（HTTP \(http.statusCode)）。在终端运行一次 claude 刷新登录后会自动恢复。")
+            return nil
+        case 429:
+            Self.record(ok: false, short: "被限流",
+                        detail: "请求太频繁，被暂时限流（HTTP 429）。程序每 5 分钟才请求一次，稍后会自动恢复。")
+            return nil
+        default:
+            Self.record(ok: false, short: "HTTP \(http.statusCode)",
+                        detail: "接口返回了 HTTP \(http.statusCode)。")
+            return nil
+        }
+        guard let usage = try? JSONDecoder().decode(LiveUsage.self, from: data) else {
+            let body = String(decoding: data.prefix(240), as: UTF8.self)
+            Self.record(ok: false, short: "格式变了",
+                        detail: "接口返回的格式和预期不一样，可能是 Anthropic 改了接口。返回内容开头：\(body)")
+            return nil
+        }
+        Self.record(ok: true, short: "正常", detail: "实时读取正常（\(Self.timeText(Date()))）。")
 
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1024,6 +1108,12 @@ struct ClaudeUsageCollector: UsageCollecting {
             updatedAt: Date(),
             error: nil
         )
+    }
+
+    private static func timeText(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M月d日 HH:mm"
+        return formatter.string(from: date)
     }
 
     // MARK: - Local fallback estimate
@@ -1114,7 +1204,7 @@ struct ClaudeUsageCollector: UsageCollecting {
             dailyResetAt: oldestFiveHour?.addingTimeInterval(5 * 3600),
             weeklyResetAt: oldestWeekly?.addingTimeInterval(7 * 24 * 3600),
             totalTokens: weeklyTokens,
-            planLabel: AppConfig.shared.claudePlanLabel ?? "est.",
+            planLabel: AppConfig.shared.claudePlanLabel ?? "估算",
             updatedAt: latest == .distantPast ? now : latest,
             error: nil
         )
@@ -1264,7 +1354,7 @@ struct OpenCodeUsageCollector: UsageCollecting {
             dailyResetAt: fiveHour.oldest.map { $0.addingTimeInterval(5 * 3600) },
             weeklyResetAt: weekly.oldest.map { $0.addingTimeInterval(7 * 24 * 3600) },
             totalTokens: weekly.total,
-            planLabel: "est.",
+            planLabel: "估算",
             updatedAt: weekly.latest ?? Date(),
             error: nil
         )
@@ -2990,6 +3080,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func refreshTouchBar() {
         refreshAuthState()
+        // 让设置窗口里的“读取状态”跟着更新
+        NotificationCenter.default.post(name: Diagnostics.changed, object: nil)
         reclaimControlStripIfWanted()
         reloadTouchBarContent()
         if let controlStripButton {
@@ -3110,6 +3202,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     @objc private func refreshButtonPressed() {
+        ClaudeUsageCollector.clearFailure()
         refresh()
     }
 
