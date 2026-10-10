@@ -16,7 +16,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Security self-check
         run: |
@@ -56,6 +56,7 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp "$BIN" "$APP/Contents/MacOS/usage-touchbar"
           cp Info.plist "$APP/Contents/Info.plist"
+          iconutil -c icns Resources/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
           codesign --force --options runtime --identifier local.usage-touchbar --sign - "$APP/Contents/MacOS/usage-touchbar"
           codesign --force --options runtime --identifier local.usage-touchbar --sign - "$APP"
           codesign --verify --verbose "$APP"
@@ -67,7 +68,7 @@ jobs:
           shasum -a 256 UsageTouchBar.dmg | tee UsageTouchBar.dmg.sha256
 
       - name: Upload DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: UsageTouchBar-dmg
           path: |

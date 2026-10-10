@@ -736,6 +736,7 @@ struct AppConfig: Codable {
     var dangerThreshold: Double?
     var refreshInterval: Double?
     var showMenuBar: Bool?
+    var showInDock: Bool?
 
     /// Mutable so the Arrange window can apply changes without a relaunch.
     nonisolated(unsafe) static var shared = load()
@@ -2224,7 +2225,17 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private let store: UsageStore
     private let statusItem: NSStatusItem?
+    /// 铺满整条 Touch Bar 的“系统模态”栏（从 Control Strip 展开 / 常驻展开）。
     private let touchBar = NSTouchBar()
+    /// 本 App 在前台时（比如打开设置窗口）显示在 App 区域的栏。
+    /// 必须和上面的分开：同一个 Touch Bar 元素不能同时出现在两处，否则内容会变成空白。
+    private let appTouchBar = NSTouchBar()
+    /// 用量内容的固定容器；刷新时只替换容器里的内容，不替换 Touch Bar 元素本身。
+    private let detailHosts = NSHashTable<TouchBarContentHost>.weakObjects()
+    private let summaryHosts = NSHashTable<TouchBarContentHost>.weakObjects()
+    private var appliedPlacement = AppConfig.shared.resolvedPlacement
+    /// 只有双击打开的 App 才显示 Dock 图标；命令行 `--touchbar` 模式不显示。
+    var allowsDockIcon = false
     private let popover = NSPopover()
     private let loginWindow = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: 420, height: 320),
@@ -2239,8 +2250,6 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     )
     private var pinTimer: Timer?
     private var controlStripWidth: NSLayoutConstraint?
-    private weak var summaryItem: NSCustomTouchBarItem?
-    private weak var detailItem: NSCustomTouchBarItem?
     private weak var codexButton: NSButton?
     private weak var claudeButton: NSButton?
     private var controlStripItem: NSCustomTouchBarItem?
@@ -2271,7 +2280,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     func start() {
-        NSApp.touchBar = touchBar
+        NSApp.touchBar = appTouchBar
+        applyDockPolicy()
         if mode == .launcher {
             showLoginIfNeeded()
             installControlStripItem()
@@ -2307,12 +2317,63 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     /// 设置窗口里任何一项改动后调用：立即应用，无需重启。
     private func applySettings() {
         AppConfig.reload()
-        statusItem?.isVisible = AppConfig.shared.resolvedShowMenuBar
+        let config = AppConfig.shared
+        statusItem?.isVisible = config.resolvedShowMenuBar
+        applyDockPolicy()
         configureTouchBar()
-        teardownControlStripItem()
-        installControlStripItem()
         refreshTouchBar()
         restartTimers()
+
+        // 只在“显示位置”真的变了时才展开 / 收起，避免每次改设置都闪一下。
+        let placement = config.resolvedPlacement
+        if placement != appliedPlacement, ControlStrip.isSupported {
+            if placement == .controlStripOnly {
+                ControlStrip.dismissModal(touchBar)
+            } else {
+                ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
+            }
+        }
+        appliedPlacement = placement
+    }
+
+    /// 是否在 Dock 显示图标。显示时需要一个最简单的 App 菜单，否则屏幕顶部菜单栏是空的。
+    private func applyDockPolicy() {
+        guard allowsDockIcon else { return }
+        let showInDock = AppConfig.shared.resolvedShowInDock
+        if showInDock, NSApp.mainMenu == nil || NSApp.mainMenu?.items.isEmpty == true {
+            NSApp.mainMenu = makeMainMenu()
+        }
+        let policy: NSApplication.ActivationPolicy = showInDock ? .regular : .accessory
+        if NSApp.activationPolicy() != policy {
+            NSApp.setActivationPolicy(policy)
+        }
+    }
+
+    private func makeMainMenu() -> NSMenu {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let appMenu = NSMenu(title: "Usage Touch Bar")
+        appItem.submenu = appMenu
+
+        let settings = NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ",")
+        settings.target = self
+        appMenu.addItem(settings)
+        let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(refreshButtonPressed), keyEquivalent: "r")
+        refreshItem.target = self
+        appMenu.addItem(refreshItem)
+        appMenu.addItem(.separator())
+        appMenu.addItem(NSMenuItem(title: "隐藏 Usage Touch Bar", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
+        appMenu.addItem(.separator())
+        appMenu.addItem(NSMenuItem(title: "退出 Usage Touch Bar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+        let windowItem = NSMenuItem()
+        main.addItem(windowItem)
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(NSMenuItem(title: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+        windowMenu.addItem(NSMenuItem(title: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+        windowItem.submenu = windowMenu
+        return main
     }
 
     /// 打开设置窗口（菜单栏、Touch Bar 齿轮、再次双击 App 都会走这里）。
@@ -2327,7 +2388,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     func makeTouchBar() -> NSTouchBar {
-        touchBar
+        appTouchBar
     }
 
     /// Removes the persistent Control Strip item before the app exits.
@@ -2345,8 +2406,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         switch identifier {
         case Self.summaryIdentifier:
             let item = NSCustomTouchBarItem(identifier: identifier)
-            item.view = makeSummaryView()
-            summaryItem = item
+            let host = TouchBarContentHost()
+            host.setContent(makeSummaryView())
+            summaryHosts.add(host)
+            item.view = host
             return item
         case Self.codexIdentifier:
             return providerButtonItem(identifier: identifier, provider: .codex)
@@ -2354,8 +2417,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             return providerButtonItem(identifier: identifier, provider: .claude)
         case Self.detailIdentifier:
             let item = NSCustomTouchBarItem(identifier: identifier)
-            item.view = makeDetailView()
-            detailItem = item
+            let host = TouchBarContentHost()
+            host.setContent(makeDetailView())
+            detailHosts.add(host)
+            item.view = host
             return item
         case Self.refreshIdentifier:
             let item = NSCustomTouchBarItem(identifier: identifier)
@@ -2399,8 +2464,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         }
         AppConfig.save(config)
         AppConfig.reload()
-        teardownControlStripItem()
-        installControlStripItem()
+        // 不再删掉再重新添加 Control Strip 图标（容易出现删了没加回来），直接更新内容。
         refreshTouchBar()
     }
 
@@ -2508,11 +2572,35 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     private func configureTouchBar() {
-        touchBar.delegate = self
-        touchBar.defaultItemIdentifiers = defaultTouchBarItems
-        touchBar.customizationAllowedItemIdentifiers = [Self.summaryIdentifier, Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
-        touchBar.customizationIdentifier = NSTouchBar.CustomizationIdentifier("UsageTouchBar.default")
-        touchBar.principalItemIdentifier = AppConfig.shared.resolvedCenterContent ? Self.detailIdentifier : nil
+        configure(touchBar, customization: "UsageTouchBar.default")
+        configure(appTouchBar, customization: "UsageTouchBar.app")
+    }
+
+    private func configure(_ bar: NSTouchBar, customization: String) {
+        if bar.delegate == nil {
+            bar.delegate = self
+            bar.customizationAllowedItemIdentifiers = [Self.summaryIdentifier, Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
+            bar.customizationIdentifier = NSTouchBar.CustomizationIdentifier(customization)
+        }
+        // 只在真的变化时才赋值：重复赋值会让系统重建所有元素，造成闪烁或空白。
+        let items = defaultTouchBarItems
+        if bar.defaultItemIdentifiers != items {
+            bar.defaultItemIdentifiers = items
+        }
+        let principal: NSTouchBarItem.Identifier? = AppConfig.shared.resolvedCenterContent ? Self.detailIdentifier : nil
+        if bar.principalItemIdentifier != principal {
+            bar.principalItemIdentifier = principal
+        }
+    }
+
+    /// 用最新数据重画所有用量内容（两条 Touch Bar 上的都会更新）。
+    private func reloadTouchBarContent() {
+        for host in detailHosts.allObjects {
+            host.setContent(makeDetailView())
+        }
+        for host in summaryHosts.allObjects {
+            host.setContent(makeSummaryView())
+        }
     }
 
     private func configurePopover() {
@@ -2747,15 +2835,17 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func refreshTouchBar() {
         refreshAuthState()
-        summaryItem?.view = makeSummaryView()
-        detailItem?.view = makeDetailView()
+        reloadTouchBarContent()
         if let controlStripButton {
+            if ownedProvider == nil {
+                controlStripButton.providers = visibleProviders
+                controlStripButton.toolTip = visibleProviders.map(\.rawValue).joined(separator: " / ")
+            }
             let image = controlStripImage(for: controlStripButton.providers)
             controlStripButton.image = image
             controlStripWidth?.constant = controlStripButtonWidth(for: controlStripButton.providers, image: image)
             controlStripButton.needsDisplay = true
         }
-        touchBar.defaultItemIdentifiers = defaultTouchBarItems
         statusItem?.button?.attributedTitle = statusAttributedTitle()
         rebuildStatusMenu()
         (popover.contentViewController as? UsageViewController)?.reload()
@@ -2882,9 +2972,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         selectedProvider = provider
         codexButton?.image = makeLogoImage(provider: .codex, selected: selectedProvider == .codex)
         claudeButton?.image = makeLogoImage(provider: .claude, selected: selectedProvider == .claude)
-        summaryItem?.view = makeSummaryView()
-        detailItem?.view = makeDetailView()
-        touchBar.defaultItemIdentifiers = defaultTouchBarItems
+        reloadTouchBarContent()
     }
 
     private func installControlStripItem() {
@@ -3587,7 +3675,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // One single app/process: all providers are shown together in one
         // Control Strip slot. (The legacy `--agent` multi-process mode that
         // produced separate binaries — and separate Keychain prompts — is gone.)
-        self.controller = MainActor.assumeIsolated { startTouchBarController() }
+        self.controller = MainActor.assumeIsolated { startTouchBarController(allowsDockIcon: true) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -3612,11 +3700,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// 20s refresh timer, and attaches the file-system watchers — none of which
 /// need an `NSApplication.run()` until the host actually calls it.
 @MainActor
-func startTouchBarController() -> TouchBarController {
+func startTouchBarController(allowsDockIcon: Bool = false) -> TouchBarController {
     let controller = TouchBarController(
         store: UsageStore(collectors: CLI.defaultCollectors()),
         mode: .launcher
     )
+    controller.allowsDockIcon = allowsDockIcon
     controller.start()
     return controller
 }

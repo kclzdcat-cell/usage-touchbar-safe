@@ -65,6 +65,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp -f "$BINARY" "$APP/Contents/MacOS/usage-touchbar"
 cp -f "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+iconutil -c icns "$ROOT/Resources/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
 
 # 3. ad-hoc 签名（不碰任何钥匙串）
 echo "› Ad-hoc signing…"
