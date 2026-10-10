@@ -711,7 +711,12 @@ enum CLI {
             CodexUsageCollector(),
             OpenCodeUsageCollector(),
             GeminiUsageCollector(),
-            GLMUsageCollector()
+            AntigravityUsageCollector(),
+            GLMUsageCollector(),
+            KimiUsageCollector(),
+            MiniMaxUsageCollector(),
+            CopilotUsageCollector(),
+            CursorUsageCollector()
         ]
     }
 }
@@ -730,5 +735,10 @@ extension UsageStore {
         OpenCodeUsageCollector.flushLiveCache()
         GeminiUsageCollector.cache.flush()
         GLMUsageCollector.cache.flush()
+        AntigravityUsageCollector.cache.flush()
+        KimiUsageCollector.cache.flush()
+        MiniMaxUsageCollector.cache.flush()
+        CopilotUsageCollector.cache.flush()
+        CursorUsageCollector.cache.flush()
     }
 }

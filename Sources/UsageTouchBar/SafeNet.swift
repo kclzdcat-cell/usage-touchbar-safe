@@ -17,6 +17,12 @@ enum SafeNet {
         "chatgpt.com",              // Codex
         "open.bigmodel.cn",         // GLM（国内）
         "api.z.ai",                 // GLM（国际）
+        "api.github.com",           // GitHub Copilot
+        "cursor.com",               // Cursor
+        "api.kimi.com",             // Kimi（国内）
+        "api.kimi.ai",              // Kimi（国际）
+        "api.minimaxi.com",         // MiniMax（国内）
+        "api.minimax.io",           // MiniMax（国际）
     ]
 
     /// 允许 POST 的具体接口（主机 + 路径）
@@ -66,6 +72,60 @@ enum SafeNet {
         default:
             return false
         }
+    }
+
+    // MARK: 本机 Antigravity
+
+    /// Antigravity 本机语言服务里查询额度的接口（只允许这一个路径）
+    static let antigravityStatusPath = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
+
+    /// 只接受 127.0.0.1 的自签名证书（Antigravity 本机服务用的就是自签名证书）；
+    /// 其他任何主机照常严格校验证书。
+    private final class LocalTrust: NSObject, URLSessionTaskDelegate, Sendable {
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            didReceive challenge: URLAuthenticationChallenge
+        ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+            guard challenge.protectionSpace.host == "127.0.0.1",
+                  challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+                  let trust = challenge.protectionSpace.serverTrust else {
+                return (.performDefaultHandling, nil)
+            }
+            return (.useCredential, URLCredential(trust: trust))
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest
+        ) async -> URLRequest? {
+            nil   // 本机请求不允许任何跳转
+        }
+    }
+
+    private static let localSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.urlCredentialStorage = nil
+        config.urlCache = nil
+        config.connectionProxyDictionary = [:]   // 本机请求不走代理
+        return URLSession(configuration: config, delegate: LocalTrust(), delegateQueue: nil)
+    }()
+
+    /// 发往本机 Antigravity 的请求：必须是 127.0.0.1、POST、固定路径。
+    static func localData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        guard let url = request.url,
+              ["https", "http"].contains(url.scheme?.lowercased() ?? ""),
+              url.host == "127.0.0.1",
+              url.path == antigravityStatusPath,
+              (request.httpMethod ?? "GET").uppercased() == "POST" else {
+            logBlocked(request, reason: "local")
+            throw URLError(.badURL)
+        }
+        return try await localSession.data(for: request)
     }
 
     static func data(for request: URLRequest) async throws -> (Data, URLResponse) {

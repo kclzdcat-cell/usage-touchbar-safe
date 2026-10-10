@@ -401,28 +401,62 @@ final class TouchBarContentHost: NSView {
 
 // MARK: - 设置窗口
 
+/// 标准 macOS 设置窗口：顶部一排分类图标，每次只显示一类设置，窗口自动调整到这一页的大小。
+@MainActor
+final class SettingsTabController: NSTabViewController {
+    var onSelect: ((Int) -> Void)?
+
+    override func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        super.tabView(tabView, didSelect: tabViewItem)
+        guard let item = tabViewItem else { return }
+        let index = tabView.indexOfTabViewItem(item)
+        onSelect?(index)
+        resizeWindow(to: item.viewController?.preferredContentSize)
+    }
+
+    /// 窗口高度跟着这一页的内容走，左上角位置不动。
+    func resizeWindow(to size: NSSize?) {
+        guard let window = view.window, let size, size.width > 0, size.height > 0 else { return }
+        let content = window.contentRect(forFrameRect: window.frame)
+        let target = window.frameRect(forContentRect: NSRect(x: content.minX, y: content.maxY - size.height,
+                                                             width: size.width, height: size.height))
+        window.setFrame(target, display: true, animate: window.isVisible)
+    }
+}
+
 @MainActor
 final class SettingsWindowController: NSWindowController {
     private let settingsVC: DisplaySettingsViewController
-    private var screenObserver: NSObjectProtocol?
+    private let tabs = SettingsTabController()
 
     init(onChange: @escaping () -> Void,
          onArrange: @escaping ([(provider: Provider, enabled: Bool)]) -> Void) {
         settingsVC = DisplaySettingsViewController(onChange: onChange, onArrange: onArrange)
-        settingsVC.title = "Usage Touch Bar 设置"
-        let window = NSWindow(contentViewController: settingsVC)
-        window.title = "Usage Touch Bar 设置"
-        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.isReleasedWhenClosed = false
-        window.contentMinSize = settingsVC.minimumSize
-        window.setContentSize(settingsVC.idealSize)
-        window.setFrameAutosaveName("UsageTouchBarSettings.v5")
-        super.init(window: window)
-        screenObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.fitToScreen() }
+        _ = settingsVC.view   // 建好所有设置页
+
+        tabs.tabStyle = .toolbar
+        tabs.transitionOptions = [.crossfade]
+        for page in settingsVC.pages {
+            let pageVC = NSViewController()
+            pageVC.view = page.view
+            pageVC.title = page.title
+            pageVC.preferredContentSize = page.size
+            let item = NSTabViewItem(viewController: pageVC)
+            item.label = page.title
+            item.image = NSImage(systemSymbolName: page.symbol, accessibilityDescription: page.title)
+            tabs.addTabViewItem(item)
         }
+
+        let window = NSWindow(contentViewController: tabs)
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.toolbarStyle = .preference
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+
+        let vc = settingsVC
+        tabs.onSelect = { index in vc.attachStatus(to: index) }
+        vc.attachStatus(to: 0)
+        if let first = settingsVC.pages.first { window.setContentSize(first.size) }
     }
 
     required init?(coder: NSCoder) {
@@ -432,29 +466,17 @@ final class SettingsWindowController: NSWindowController {
     func present() {
         settingsVC.reload()
         if window?.isVisible != true {
-            fitToScreen()
+            let index = max(0, tabs.selectedTabViewItemIndex)
+            tabs.resizeWindow(to: settingsVC.pages[safe: index]?.size)
             window?.center()
         }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
-
-    /// 换了显示器或改了分辨率后，窗口不超出屏幕。
-    func fitToScreen() {
-        guard let window, let screen = window.screen ?? NSScreen.main else { return }
-        let visible = screen.visibleFrame
-        var frame = window.frame
-        frame.size.width = min(frame.width, visible.width - 20)
-        frame.size.height = min(frame.height, visible.height - 20)
-        frame.origin.x = min(max(frame.minX, visible.minX + 10), visible.maxX - frame.width - 10)
-        frame.origin.y = min(max(frame.minY, visible.minY + 10), visible.maxY - frame.height - 10)
-        window.setFrame(frame, display: true, animate: false)
-    }
 }
 
-/// 让滚动区域的内容从左上角开始排。
-private final class FlippedView: NSView {
-    override var isFlipped: Bool { true }
+extension Array {
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }
 
 @MainActor
@@ -498,20 +520,27 @@ final class DisplaySettingsViewController: NSViewController {
     private let glmKeyField = NSSecureTextField()
     private let glmRegionPopup = NSPopUpButton()
     private let glmSourceLabel = NSTextField(wrappingLabelWithString: "")
-    private let glmSaveButton = NSButton(title: "保存 Key", target: nil, action: nil)
     private let geminiNote = NSTextField(wrappingLabelWithString: "")
     private let estimateSwitch = NSSwitch()
     private let addFrontAppButton = NSButton(title: "把它加入音乐 App 列表", target: nil, action: nil)
-    /// 三栏设置；按窗口宽度组合成 3 栏 / 2 栏 / 1 栏
-    private var grids: [NSGridView] = []
-    private var gridWidths: [CGFloat] = []
-    private let rowsStack = NSStackView()
-    private let content = NSStackView()
-    private var columnCount = 0
-    private var clipObserver: NSObjectProtocol?
-    private var pendingReflow = false
-    private static let columnGap: CGFloat = 56
-    private static let margin: CGFloat = 28
+    // 账号页：需要填 API Key 的服务
+    private let kimiKeyField = NSSecureTextField()
+    private let kimiRegionPopup = NSPopUpButton()
+    private let minimaxKeyField = NSSecureTextField()
+    private let minimaxRegionPopup = NSPopUpButton()
+    private let copilotKeyField = NSSecureTextField()
+    private let keySourcesLabel = NSTextField(wrappingLabelWithString: "")
+    private let autoSourcesLabel = NSTextField(wrappingLabelWithString: "")
+
+    /// 每一页：标题、图标、内容和底部放状态提示的位置
+    struct Page {
+        let title: String
+        let symbol: String
+        let view: NSView
+        let footer: NSView
+        let size: NSSize
+    }
+    private(set) var pages: [Page] = []
     private var diagnosticsObserver: NSObjectProtocol?
 
     private var arrangement: [(provider: Provider, enabled: Bool)] = []
@@ -534,96 +563,35 @@ final class DisplaySettingsViewController: NSViewController {
         fatalError("init(coder:) has not been implemented")
     }
 
-    /// 窗口第一次打开时的大小：按屏幕分辨率挑一个能放下最多栏的宽度。
-    var idealSize: NSSize {
-        _ = view
-        let screen = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1400, height: 800)
-        applyColumnCount(columnCount(forWidth: screen.width - 40))
-        let fitting = content.fittingSize
-        return NSSize(width: min(fitting.width + Self.margin * 2, screen.width - 40),
-                      height: min(max(360, fitting.height + 44), screen.height - 60))
-    }
-
-    /// 最窄能缩到只剩一栏。
-    var minimumSize: NSSize {
-        _ = view
-        return NSSize(width: (gridWidths.max() ?? 420) + Self.margin * 2, height: 360)
-    }
-
-    private func columnCount(forWidth width: CGFloat) -> Int {
-        guard gridWidths.count == 3 else { return 3 }
-        let available = width - Self.margin * 2
-        let w = gridWidths
-        if w[0] + w[1] + w[2] + Self.columnGap * 2 <= available { return 3 }
-        if max(w[0] + w[1] + Self.columnGap, w[2]) <= available { return 2 }
-        return 1
-    }
-
-    /// 重新组合分栏。只在栏数变化时才动，并且只在排版结束之后调用。
-    private func applyColumnCount(_ count: Int) {
-        guard count != columnCount, grids.count == 3 else { return }
-        columnCount = count
-        for row in rowsStack.arrangedSubviews {
-            rowsStack.removeArrangedSubview(row)
-            row.removeFromSuperview()
-        }
-        grids.forEach { $0.removeFromSuperview() }
-        let groups: [[NSGridView]]
-        switch count {
-        case 3: groups = [grids]
-        case 2: groups = [[grids[0], grids[1]], [grids[2]]]
-        default: groups = grids.map { [$0] }
-        }
-        for group in groups {
-            rowsStack.addArrangedSubview(makeRow(group))
-        }
-    }
-
-    /// 一行里的几栏：顶部对齐，等间距。
-    private func makeRow(_ group: [NSGridView]) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        var constraints: [NSLayoutConstraint] = []
-        var previous: NSView?
-        for grid in group {
-            grid.translatesAutoresizingMaskIntoConstraints = false
-            row.addSubview(grid)
-            constraints += [
-                grid.topAnchor.constraint(equalTo: row.topAnchor),
-                grid.bottomAnchor.constraint(lessThanOrEqualTo: row.bottomAnchor),
-            ]
-            if let previous {
-                constraints.append(grid.leadingAnchor.constraint(equalTo: previous.trailingAnchor, constant: Self.columnGap))
-            } else {
-                constraints.append(grid.leadingAnchor.constraint(equalTo: row.leadingAnchor))
-            }
-            previous = grid
-        }
-        if let previous {
-            constraints.append(previous.trailingAnchor.constraint(equalTo: row.trailingAnchor))
-        }
-        let shortest = row.heightAnchor.constraint(equalToConstant: 0)
-        shortest.priority = .defaultLow
-        constraints.append(shortest)
-        NSLayoutConstraint.activate(constraints)
-        return row
-    }
-
-    /// 窗口宽度变了：排版结束后再判断要不要换栏数，避免在排版过程中改布局。
-    private func scheduleReflow() {
-        guard !pendingReflow else { return }
-        pendingReflow = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.pendingReflow = false
-            guard let scroll = self.view as? NSScrollView else { return }
-            self.applyColumnCount(self.columnCount(forWidth: scroll.contentView.bounds.width))
-        }
-    }
-
     override func loadView() {
         configureControls()
+        configureLabels()
+        pages = buildPages()
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 10, height: 10))   // 各页单独放进设置窗口
+        reload()
+        // 重新量一次尺寸（reload 填好了服务列表等内容）
+        pages = pages.map { Page(title: $0.title, symbol: $0.symbol, view: $0.view, footer: $0.footer, size: measure($0.view)) }
+    }
 
+    /// 把底部的状态提示移到当前这一页。
+    func attachStatus(to index: Int) {
+        guard let page = pages[safe: index] else { return }
+        statusLabel.removeFromSuperview()
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        page.footer.addSubview(statusLabel)
+        NSLayoutConstraint.activate([
+            statusLabel.leadingAnchor.constraint(equalTo: page.footer.leadingAnchor),
+            statusLabel.trailingAnchor.constraint(equalTo: page.footer.trailingAnchor),
+            statusLabel.topAnchor.constraint(equalTo: page.footer.topAnchor),
+        ])
+    }
+
+    private func measure(_ view: NSView) -> NSSize {
+        let fitting = view.fittingSize
+        return NSSize(width: max(560, ceil(fitting.width)), height: ceil(fitting.height))
+    }
+
+    private func buildPages() -> [Page] {
         let resetColors = NSButton(title: "恢复默认样式", target: self, action: #selector(resetStyle(_:)))
         resetColors.bezelStyle = .rounded
         resetColors.controlSize = .small
@@ -633,101 +601,150 @@ final class DisplaySettingsViewController: NSViewController {
         musicApps.alignment = .leading
         musicApps.spacing = 4
 
-        let musicTip = NSTextField(wrappingLabelWithString:
-            "其他 App 可以填 Bundle ID，用逗号分隔。查询方法：终端运行 mdls -name kMDItemCFBundleIdentifier \"/Applications/某某.app\"")
-        musicTip.font = .systemFont(ofSize: 11)
-        musicTip.textColor = .secondaryLabelColor
-        musicTip.preferredMaxLayoutWidth = 320
+        let musicTip = note("其他 App 可以填 Bundle ID，用逗号分隔。查询方法：终端运行 mdls -name kMDItemCFBundleIdentifier \"/Applications/某某.app\"")
 
-        let column1 = makeGrid([
-            .section("显示哪些服务（最多 3 个，↑ ↓ 调整顺序）"),
-            .full(providerStack),
-            .section("Touch Bar"),
-            .item("显示位置：", placementPopup),
-            .item("展开后内容：", alignPopup),
-            .item("Control Strip 样式：", stripStylePopup),
-            .item("刷新 / 设置按钮：", buttonsSwitch),
-            .section("显示内容"),
-            .item("主要显示：", metricPopup),
-            .item("同时显示另一项额度：", secondarySwitch),
-            .item("显示重置倒计时：", resetSwitch),
-        ])
-        let column2 = makeGrid([
-            .section("用量颜色"),
-            .item("配色：", colorPopup),
-            .item("超过多少变橙色：", warnPopup),
-            .item("超过多少变红色：", dangerPopup),
-            .section("文字与图标"),
-            .item("字号：", fontSizeControl),
-            .item("图标大小：", iconSizeControl),
-            .item("服务名称颜色：", nameColorWell),
-            .item("百分比数字颜色：", percentColorWell),
-            .item("套餐、倒计时颜色：", detailColorWell),
-            .item("", resetColors),
-            .section("读取状态"),
-            .full(claudeStatusLabel),
-            .item("取不到时显示本地估算：", estimateSwitch),
-            .section("其他"),
-            .item("刷新间隔：", intervalPopup),
-            .item("菜单栏显示用量文字：", menuBarSwitch),
-            .item("在 Dock 显示图标：", dockSwitch),
-            .item("登录时自动启动：", loginSwitch),
-        ])
-        let glmKeyRow = NSStackView(views: [glmKeyField, glmSaveButton])
-        glmKeyRow.orientation = .horizontal
-        glmKeyRow.spacing = 8
-        let column3 = makeGrid([
-            .section("GLM / ZCode（智谱 GLM Coding Plan）"),
-            .item("区域：", glmRegionPopup),
-            .item("API Key：", glmKeyRow),
-            .full(glmSourceLabel),
-            .section("Gemini"),
-            .full(geminiNote),
-            .section("音乐 App（歌词）"),
-            .item("音乐 App 在前台时：", musicModePopup),
-            .item("Control Strip 图标：", slotPopup),
-            .item("对这些 App 生效：", musicApps),
-            .item("其他 App：", customMusicField),
-            .full(musicTip),
-            .full(diagnosticsLabel),
-            .full(addFrontAppButton),
-        ])
+        func keyRow(_ field: NSSecureTextField, tag: Int) -> NSView {
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.widthAnchor.constraint(equalToConstant: 230).isActive = true
+            let save = NSButton(title: "保存", target: self, action: #selector(saveAPIKey(_:)))
+            save.bezelStyle = .rounded
+            save.controlSize = .small
+            save.tag = tag
+            let row = NSStackView(views: [field, save])
+            row.orientation = .horizontal
+            row.spacing = 8
+            return row
+        }
 
-        // 自适应：窗口够宽三栏并排，窄一些自动换成两栏、一栏
-        grids = [column1, column2, column3]
-        rowsStack.orientation = .vertical
-        rowsStack.alignment = .leading
-        rowsStack.spacing = 34
+        let definitions: [(String, String, [Row])] = [
+            ("服务", "square.grid.2x2", [
+                .section("显示哪些服务（最多同时显示 3 个，↑ ↓ 调整从左到右的顺序）"),
+                .full(providerStack),
+                .section("读取状态"),
+                .full(claudeStatusLabel),
+                .item("取不到实时数据时显示本地估算：", estimateSwitch),
+            ]),
+            ("账号", "key", [
+                .section("自动读取（不用填）"),
+                .full(autoSourcesLabel),
+                .section("GLM / ZCode（智谱 GLM Coding Plan）"),
+                .item("区域：", glmRegionPopup),
+                .item("API Key：", keyRow(glmKeyField, tag: 0)),
+                .full(glmSourceLabel),
+                .section("Kimi（Kimi Code 编程套餐）"),
+                .item("区域：", kimiRegionPopup),
+                .item("API Key：", keyRow(kimiKeyField, tag: 1)),
+                .section("MiniMax（编程套餐）"),
+                .item("区域：", minimaxRegionPopup),
+                .item("API Key：", keyRow(minimaxKeyField, tag: 2)),
+                .section("GitHub Copilot（可选）"),
+                .item("GitHub 令牌：", keyRow(copilotKeyField, tag: 3)),
+                .full(keySourcesLabel),
+            ]),
+            ("显示", "rectangle.split.3x1", [
+                .section("Touch Bar"),
+                .item("显示位置：", placementPopup),
+                .item("展开后内容：", alignPopup),
+                .item("Control Strip 样式：", stripStylePopup),
+                .item("刷新 / 设置按钮：", buttonsSwitch),
+                .section("显示内容"),
+                .item("主要显示：", metricPopup),
+                .item("同时显示另一项额度：", secondarySwitch),
+                .item("显示重置倒计时：", resetSwitch),
+            ]),
+            ("外观", "paintpalette", [
+                .section("用量颜色"),
+                .item("配色：", colorPopup),
+                .item("超过多少变橙色：", warnPopup),
+                .item("超过多少变红色：", dangerPopup),
+                .section("文字与图标"),
+                .item("字号：", fontSizeControl),
+                .item("图标大小：", iconSizeControl),
+                .item("服务名称颜色：", nameColorWell),
+                .item("百分比数字颜色：", percentColorWell),
+                .item("套餐、倒计时颜色：", detailColorWell),
+                .item("", resetColors),
+            ]),
+            ("音乐", "music.note", [
+                .section("音乐 App 在前台时（QQ音乐、网易云音乐等用 Touch Bar 显示歌词）"),
+                .item("处理方式：", musicModePopup),
+                .item("Control Strip 图标：", slotPopup),
+                .item("对这些 App 生效：", musicApps),
+                .item("其他 App：", customMusicField),
+                .full(musicTip),
+                .section("诊断"),
+                .full(diagnosticsLabel),
+                .full(addFrontAppButton),
+            ]),
+            ("通用", "gearshape", [
+                .section("通用"),
+                .item("刷新间隔：", intervalPopup),
+                .item("菜单栏显示用量文字：", menuBarSwitch),
+                .item("在 Dock 显示图标：", dockSwitch),
+                .item("登录时自动启动：", loginSwitch),
+            ]),
+        ]
 
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 18
-        content.addArrangedSubview(rowsStack)
+        return definitions.map { title, symbol, rows in
+            let grid = makeGrid(rows)
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            let footer = NSView()
+            footer.translatesAutoresizingMaskIntoConstraints = false
+            let container = NSView()
+            container.addSubview(grid)
+            container.addSubview(footer)
+            NSLayoutConstraint.activate([
+                grid.topAnchor.constraint(equalTo: container.topAnchor, constant: 22),
+                grid.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 30),
+                grid.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -30),
+                footer.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 18),
+                footer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 30),
+                footer.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -30),
+                footer.heightAnchor.constraint(equalToConstant: 32),
+                footer.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -14),
+                container.widthAnchor.constraint(greaterThanOrEqualToConstant: 560),
+            ])
+            return Page(title: title, symbol: symbol, view: container, footer: footer, size: measure(container))
+        }
+    }
 
+    private func note(_ text: String) -> NSTextField {
+        let field = NSTextField(wrappingLabelWithString: text)
+        field.font = .systemFont(ofSize: 11)
+        field.textColor = .secondaryLabelColor
+        field.preferredMaxLayoutWidth = 480
+        return field
+    }
+
+    private func configureLabels() {
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
+        statusLabel.maximumNumberOfLines = 2
+        statusLabel.preferredMaxLayoutWidth = 500
         statusLabel.stringValue = "修改后立即生效，保存在 ~/.config/usage-touchbar/config.json。"
 
         glmRegionPopup.addItems(withTitles: ["国内（open.bigmodel.cn）", "国际（api.z.ai）"])
         glmRegionPopup.target = self
         glmRegionPopup.action = #selector(glmRegionChanged(_:))
+        kimiRegionPopup.addItems(withTitles: ["国内（kimi.com）", "国际（kimi.ai）"])
+        minimaxRegionPopup.addItems(withTitles: ["国内（minimaxi.com）", "国际（minimax.io）"])
+        for popup in [kimiRegionPopup, minimaxRegionPopup] {
+            popup.target = self
+            popup.action = #selector(otherRegionChanged(_:))
+        }
         glmKeyField.placeholderString = "留空则自动读取 Claude Code 里的配置"
-        glmKeyField.translatesAutoresizingMaskIntoConstraints = false
-        glmKeyField.widthAnchor.constraint(equalToConstant: 210).isActive = true
-        glmSaveButton.target = self
-        glmSaveButton.action = #selector(saveGLMKey(_:))
-        glmSaveButton.bezelStyle = .rounded
-        glmSaveButton.controlSize = .small
-        for label in [glmSourceLabel, geminiNote] {
+        kimiKeyField.placeholderString = "Kimi Code 控制台里创建的 API Key"
+        minimaxKeyField.placeholderString = "编程套餐的 API Key"
+        copilotKeyField.placeholderString = "一般不用填，会自动读取 Copilot 插件的登录"
+        for label in [glmSourceLabel, geminiNote, keySourcesLabel, autoSourcesLabel] {
             label.font = .systemFont(ofSize: 11)
             label.textColor = .secondaryLabelColor
-            label.preferredMaxLayoutWidth = 340
+            label.preferredMaxLayoutWidth = 480
         }
-        geminiNote.stringValue = "读取 Gemini CLI 的登录（~/.gemini/oauth_creds.json）。没装的话先在终端安装并运行 gemini，用 Google 账号登录一次。主要显示 Pro 模型额度，次要显示 Flash。"
         claudeStatusLabel.font = .systemFont(ofSize: 12)
-        claudeStatusLabel.preferredMaxLayoutWidth = 380
+        claudeStatusLabel.preferredMaxLayoutWidth = 480
         diagnosticsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        diagnosticsLabel.preferredMaxLayoutWidth = 300
+        diagnosticsLabel.preferredMaxLayoutWidth = 480
         addFrontAppButton.target = self
         addFrontAppButton.action = #selector(addFrontApp(_:))
         addFrontAppButton.bezelStyle = .rounded
@@ -737,47 +754,6 @@ final class DisplaySettingsViewController: NSViewController {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateDiagnostics() }
         }
-        content.addArrangedSubview(statusLabel)
-        content.translatesAutoresizingMaskIntoConstraints = false
-
-        // 放进滚动区域：窗口可以随意拉大缩小，放不下时上下滚动
-        let document = FlippedView()
-        document.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(content)
-
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.drawsBackground = false
-        scroll.documentView = document
-
-        let clip = scroll.contentView
-        NSLayoutConstraint.activate([
-            content.topAnchor.constraint(equalTo: document.topAnchor, constant: 22),
-            content.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: Self.margin),
-            content.trailingAnchor.constraint(lessThanOrEqualTo: document.trailingAnchor, constant: -Self.margin),
-            content.bottomAnchor.constraint(lessThanOrEqualTo: document.bottomAnchor, constant: -20),
-            document.topAnchor.constraint(equalTo: clip.topAnchor),
-            document.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
-            document.widthAnchor.constraint(greaterThanOrEqualTo: clip.widthAnchor),
-            document.heightAnchor.constraint(greaterThanOrEqualTo: clip.heightAnchor),
-        ])
-        statusLabel.preferredMaxLayoutWidth = 600
-
-        clip.postsFrameChangedNotifications = true
-        clipObserver = NotificationCenter.default.addObserver(
-            forName: NSView.frameDidChangeNotification, object: clip, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.scheduleReflow() }
-        }
-
-        scroll.frame = NSRect(x: 0, y: 0, width: 900, height: 600)
-        view = scroll
-        reload()
-        // 量一次每栏需要的宽度（在排版之外做），再按默认宽度排成三栏
-        gridWidths = grids.map { ceil($0.fittingSize.width) }
-        applyColumnCount(3)
     }
 
 
@@ -911,7 +887,9 @@ final class DisplaySettingsViewController: NSViewController {
         dockSwitch.state = config.resolvedShowInDock ? .on : .off
         glmRegionPopup.selectItem(at: config.glmRegion == "intl" ? 1 : 0)
         glmKeyField.stringValue = ""
-        glmSourceLabel.stringValue = GLMCredentials.sourceDescription
+        kimiRegionPopup.selectItem(at: config.kimiRegion == "intl" ? 1 : 0)
+        minimaxRegionPopup.selectItem(at: config.minimaxRegion == "intl" ? 1 : 0)
+        updateAccountLabels()
         estimateSwitch.state = config.claudeOfflineEstimate == true ? .on : .off
         slotPopup.selectItem(at: StripSlotPolicy.allCases.firstIndex(of: config.resolvedStripSlotPolicy) ?? 0)
         loginSwitch.state = LaunchAtLogin.isEnabled ? .on : .off
@@ -931,8 +909,13 @@ final class DisplaySettingsViewController: NSViewController {
             lines.append("Claude：还没有读取过（点 Touch Bar 上的刷新按钮可立即读取）。")
         }
         let visible = AppConfig.shared.orderedVisibleProviders
-        for (provider, cache) in [(Provider.gemini, GeminiUsageCollector.cache), (Provider.glm, GLMUsageCollector.cache)]
-            where visible.contains(provider) {
+        let caches: [(Provider, LiveCache)] = [
+            (.gemini, GeminiUsageCollector.cache), (.antigravity, AntigravityUsageCollector.cache),
+            (.glm, GLMUsageCollector.cache), (.kimi, KimiUsageCollector.cache),
+            (.minimax, MiniMaxUsageCollector.cache), (.copilot, CopilotUsageCollector.cache),
+            (.cursor, CursorUsageCollector.cache),
+        ]
+        for (provider, cache) in caches where visible.contains(provider) {
             if let status = cache.lastStatus() {
                 lines.append((status.ok ? "✓ " : "✗ ") + provider.rawValue + "：" + status.detail)
                 anyFailed = anyFailed || !status.ok
@@ -1063,17 +1046,70 @@ final class DisplaySettingsViewController: NSViewController {
 
     // MARK: GLM
 
-    @objc private func saveGLMKey(_ sender: Any?) {
-        let key = glmKeyField.stringValue
-        if GLMCredentials.saveKey(key) {
-            statusLabel.stringValue = key.isEmpty ? "已清除填写的 Key，改为自动读取 Claude Code 的配置。" : "已保存 GLM API Key（只保存在你电脑上，文件权限仅你自己可读）。"
-        } else {
-            statusLabel.stringValue = "保存 Key 失败。"
+    /// 保存 API Key（按钮的 tag：0 GLM、1 Kimi、2 MiniMax、3 Copilot）。留空保存表示清除。
+    @objc private func saveAPIKey(_ sender: NSButton) {
+        let ok: Bool
+        let name: String
+        let field: NSSecureTextField
+        switch sender.tag {
+        case 0:
+            field = glmKeyField; name = "GLM"
+            ok = GLMCredentials.saveKey(field.stringValue)
+            GLMUsageCollector.cache.flush()
+        case 1:
+            field = kimiKeyField; name = "Kimi"
+            ok = APIKeyStore.save(field.stringValue, for: .kimi)
+            KimiUsageCollector.cache.flush()
+        case 2:
+            field = minimaxKeyField; name = "MiniMax"
+            ok = APIKeyStore.save(field.stringValue, for: .minimax)
+            MiniMaxUsageCollector.cache.flush()
+        default:
+            field = copilotKeyField; name = "GitHub"
+            ok = APIKeyStore.save(field.stringValue, for: .copilot)
+            CopilotUsageCollector.cache.flush()
         }
-        glmKeyField.stringValue = ""
-        glmSourceLabel.stringValue = GLMCredentials.sourceDescription
-        GLMUsageCollector.cache.flush()
+        let cleared = field.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
+        statusLabel.stringValue = !ok ? "保存失败。"
+            : cleared ? "已清除 \(name) 的 Key。"
+            : "已保存 \(name) 的 Key（只保存在你电脑上，仅你自己的账户可读）。"
+        field.stringValue = ""
+        updateAccountLabels()
         onChange()
+    }
+
+    @objc private func otherRegionChanged(_ sender: NSPopUpButton) {
+        var config = AppConfig.shared
+        let value = sender.indexOfSelectedItem == 1 ? "intl" : "cn"
+        if sender === kimiRegionPopup {
+            config.kimiRegion = value
+            KimiUsageCollector.cache.flush()
+        } else {
+            config.minimaxRegion = value
+            MiniMaxUsageCollector.cache.flush()
+        }
+        AppConfig.save(config)
+        statusLabel.stringValue = "已切换区域。"
+        onChange()
+    }
+
+    /// 账号页上“哪些已配置”的说明文字。
+    private func updateAccountLabels() {
+        glmSourceLabel.stringValue = GLMCredentials.sourceDescription
+        func mark(_ ok: Bool) -> String { ok ? "✓" : "—" }
+        let antigravity = AntigravityLocal.isRunning
+        let antigravityInstalled = FileManager.default.fileExists(atPath: "/Applications/Antigravity.app")
+        autoSourcesLabel.stringValue = [
+            "\(mark(true)) Claude：读取 Claude Code 的登录（钥匙串）",
+            "\(mark(FileManager.default.fileExists(atPath: DataFiles.expand("~/.codex/auth.json")))) Codex：读取 ~/.codex/auth.json",
+            "\(mark(GeminiCredentials.isLoggedIn)) Gemini：读取 Gemini CLI 的 Google 登录（在终端运行 gemini 登录一次）",
+            "\(mark(antigravity)) Antigravity：读取本机正在运行的 Antigravity（\(antigravity ? "正在运行" : antigravityInstalled ? "打开 Antigravity 后自动读取" : "没有安装"))",
+            "\(mark(CursorCredentials.cookie() != nil)) Cursor：读取 Cursor App 的登录（打开 Cursor 登录一次即可）",
+            "\(mark(CopilotCredentials.token() != nil)) GitHub Copilot：读取 Copilot 插件的登录（~/.config/github-copilot）",
+        ].joined(separator: "\n")
+        let kimi = APIKeyStore.key(for: .kimi) != nil
+        let minimax = APIKeyStore.key(for: .minimax) != nil
+        keySourcesLabel.stringValue = "Kimi：\(kimi ? "已填写 Key" : "未填写")；MiniMax：\(minimax ? "已填写 Key" : "未填写")。Key 只保存在 ~/.config/usage-touchbar/ 里（仅你自己的账户可读），只会发给对应服务自己的接口。"
     }
 
     @objc private func glmRegionChanged(_ sender: Any?) {

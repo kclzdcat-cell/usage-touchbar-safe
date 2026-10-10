@@ -59,7 +59,12 @@ enum Provider: String, CaseIterable, Sendable {
     case codex = "Codex"
     case opencode = "OpenCode"
     case gemini = "Gemini"
+    case antigravity = "Antigravity"
     case glm = "GLM"
+    case kimi = "Kimi"
+    case minimax = "MiniMax"
+    case copilot = "Copilot"
+    case cursor = "Cursor"
 
     /// 最多同时显示几个服务（Touch Bar 宽度有限）
     static let maxVisible = 3
@@ -75,7 +80,12 @@ enum Provider: String, CaseIterable, Sendable {
         case .codex: "CX"
         case .opencode: "OC"
         case .gemini: "GM"
+        case .antigravity: "AG"
         case .glm: "GL"
+        case .kimi: "KM"
+        case .minimax: "MM"
+        case .copilot: "CP"
+        case .cursor: "CU"
         }
     }
 
@@ -85,7 +95,12 @@ enum Provider: String, CaseIterable, Sendable {
         case .codex: URL(string: "https://chatgpt.com/codex")!
         case .opencode: URL(string: "https://opencode.ai/auth")!
         case .gemini: URL(string: "https://gemini.google.com")!
+        case .antigravity: URL(string: "https://antigravity.google")!
         case .glm: URL(string: "https://bigmodel.cn/glm-coding")!
+        case .kimi: URL(string: "https://kimi.com")!
+        case .minimax: URL(string: "https://platform.minimaxi.com")!
+        case .copilot: URL(string: "https://github.com/settings/copilot")!
+        case .cursor: URL(string: "https://cursor.com")!
         }
     }
 
@@ -95,7 +110,12 @@ enum Provider: String, CaseIterable, Sendable {
         case .codex: NSColor(calibratedWhite: 0.92, alpha: 1)
         case .opencode: NSColor(calibratedRed: 0.36, green: 0.64, blue: 0.96, alpha: 1)
         case .gemini: NSColor(calibratedRed: 0.30, green: 0.55, blue: 0.98, alpha: 1)
+        case .antigravity: NSColor(calibratedRed: 0.36, green: 0.70, blue: 0.95, alpha: 1)
         case .glm: NSColor(calibratedRed: 0.40, green: 0.42, blue: 0.98, alpha: 1)
+        case .kimi: NSColor(calibratedWhite: 0.85, alpha: 1)
+        case .minimax: NSColor(calibratedRed: 0.95, green: 0.35, blue: 0.40, alpha: 1)
+        case .copilot: NSColor(calibratedRed: 0.62, green: 0.48, blue: 0.95, alpha: 1)
+        case .cursor: NSColor(calibratedWhite: 0.78, alpha: 1)
         }
     }
 }
@@ -159,7 +179,12 @@ struct AuthState {
 enum AuthDetector {
     static func current() -> AuthState {
         AuthState(connectedProviders: Set(Provider.allCases.filter { provider in
-            if provider == .glm { return GLMCredentials.current() != nil }
+            switch provider {
+            case .glm: return GLMCredentials.current() != nil
+            case .kimi, .minimax: return APIKeyStore.key(for: provider) != nil
+            case .copilot: return CopilotCredentials.token() != nil
+            default: break
+            }
             return authPaths(for: provider).contains { FileManager.default.fileExists(atPath: expand($0)) }
         }))
     }
@@ -186,8 +211,12 @@ enum AuthDetector {
             ]
         case .gemini:
             ["~/.gemini/oauth_creds.json"]
-        case .glm:
-            []   // GLM 用 API Key，见 GLMCredentials
+        case .glm, .kimi, .minimax, .copilot:
+            []   // 用 API Key 或登录令牌，见各自的 Credentials
+        case .antigravity:
+            ["/Applications/Antigravity.app", "~/Applications/Antigravity.app"]
+        case .cursor:
+            ["~/Library/Application Support/Cursor/User/globalStorage/state.vscdb"]
         }
     }
 
@@ -222,7 +251,7 @@ final class UsageStore: @unchecked Sendable {
     func refresh() async -> [UsageSnapshot] {
         // Gemini、GLM 只在你选择显示时才去请求（没勾选就不会连接 Google / 智谱）
         let visible = Set(AppConfig.shared.orderedVisibleProviders)
-        let optIn: Set<Provider> = [.gemini, .glm]
+        let optIn: Set<Provider> = [.gemini, .antigravity, .glm, .kimi, .minimax, .copilot, .cursor]
         let active = collectors.filter { !optIn.contains($0.provider) || visible.contains($0.provider) }
         let collected = await withTaskGroup(of: UsageSnapshot.self) { group in
             for collector in active {
@@ -767,6 +796,8 @@ struct AppConfig: Codable {
     var stripSlotPolicy: String?      // StripSlotPolicy.rawValue
     var claudeOfflineEstimate: Bool?  // 取不到实时数据时是否显示本地估算（默认不显示）
     var glmRegion: String?            // "cn" 国内 open.bigmodel.cn / "intl" 国际 api.z.ai
+    var kimiRegion: String?           // "cn" kimi.com / "intl" kimi.ai
+    var minimaxRegion: String?        // "cn" minimaxi.com / "intl" minimax.io
     var fontSize: String?             // FontSizeOption.rawValue
     var iconSize: String?             // IconSizeOption.rawValue
     var nameColor: String?            // "#RRGGBB"，服务名称
@@ -1867,6 +1898,9 @@ final class ProviderLogoView: NSView {
         case .glm:
             fill = NSColor(calibratedRed: 0.24, green: 0.24, blue: 0.70, alpha: 1)
             stroke = NSColor(calibratedRed: 0.70, green: 0.72, blue: 1.0, alpha: 1)
+        case .antigravity, .kimi, .minimax, .copilot, .cursor:
+            fill = provider.accentColor.blended(withFraction: 0.55, of: .black) ?? .darkGray
+            stroke = provider.accentColor
         }
 
         fill.setFill()
@@ -1914,6 +1948,21 @@ enum ProviderBranding {
             bundleID = "ai.zhipu.zcode"
             fallbackPath = FileManager.default.fileExists(atPath: "/Applications/ZCode.app")
                 ? "/Applications/ZCode.app" : "/Applications/Z Code.app"
+        case .antigravity:
+            bundleID = "com.google.antigravity"
+            fallbackPath = "/Applications/Antigravity.app"
+        case .kimi:
+            bundleID = "com.moonshot.kimi"
+            fallbackPath = "/Applications/Kimi.app"
+        case .minimax:
+            bundleID = "com.minimax.desktop"
+            fallbackPath = "/Applications/MiniMax.app"
+        case .copilot:
+            bundleID = "com.github.GitHubClient"
+            fallbackPath = "/Applications/GitHub Desktop.app"
+        case .cursor:
+            bundleID = "com.todesktop.230313mzl4w4u92"
+            fallbackPath = "/Applications/Cursor.app"
         }
         let workspace = NSWorkspace.shared
         let url = workspace.urlForApplication(withBundleIdentifier: bundleID)
