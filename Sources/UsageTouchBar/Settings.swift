@@ -443,9 +443,13 @@ final class SettingsWindowController: NSWindowController {
 }
 
 /// 设置窗口的滚动内容：上面是自适应的几栏，下面是一行状态提示。
+///
+/// 注意：layout() 里只用缓存好的尺寸摆放位置，绝不在这里计算 fittingSize——
+/// 计算尺寸本身会触发排版，在排版过程中调用会无限循环，导致卡死和崩溃。
 @MainActor
 final class SettingsDocumentView: NSView {
     static let margin: CGFloat = 28
+    static let footerHeight: CGFloat = 40
     var columns: AdaptiveColumnsView? {
         didSet {
             oldValue?.removeFromSuperview()
@@ -455,7 +459,11 @@ final class SettingsDocumentView: NSView {
     var footer: NSTextField? {
         didSet {
             oldValue?.removeFromSuperview()
-            if let footer { addSubview(footer) }
+            if let footer {
+                footer.maximumNumberOfLines = 2
+                footer.lineBreakMode = .byTruncatingTail
+                addSubview(footer)
+            }
         }
     }
 
@@ -464,9 +472,7 @@ final class SettingsDocumentView: NSView {
     func height(forWidth width: CGFloat) -> CGFloat {
         let inner = max(10, width - Self.margin * 2)
         let columnsHeight = columns?.arrangement(forWidth: inner).height ?? 0
-        footer?.preferredMaxLayoutWidth = inner
-        let footerHeight = footer?.fittingSize.height ?? 0
-        return 22 + columnsHeight + 20 + footerHeight + 22
+        return 22 + columnsHeight + 20 + Self.footerHeight + 16
     }
 
     override func layout() {
@@ -478,10 +484,7 @@ final class SettingsDocumentView: NSView {
             columns.frame = NSRect(x: Self.margin, y: y, width: inner, height: height)
             y += height + 20
         }
-        if let footer {
-            footer.preferredMaxLayoutWidth = inner
-            footer.frame = NSRect(x: Self.margin, y: y, width: inner, height: footer.fittingSize.height)
-        }
+        footer?.frame = NSRect(x: Self.margin, y: y, width: inner, height: Self.footerHeight)
     }
 }
 
@@ -490,6 +493,8 @@ final class SettingsDocumentView: NSView {
 @MainActor
 final class AdaptiveColumnsView: NSView {
     private var items: [NSView] = []
+    /// 每一栏的尺寸缓存。只在内容变化时由 measure() 更新。
+    private var sizes: [NSSize] = []
     private var separators: [NSRect] = []
     private let minGap: CGFloat = 44
     private let rowGap: CGFloat = 30
@@ -503,22 +508,27 @@ final class AdaptiveColumnsView: NSView {
             view.translatesAutoresizingMaskIntoConstraints = true
             addSubview(view)
         }
-        needsLayout = true
+        measure()
     }
 
-    private func size(of view: NSView) -> NSSize {
-        let fitting = view.fittingSize
-        return NSSize(width: ceil(fitting.width), height: ceil(fitting.height))
+    /// 重新计算每一栏需要多大。内容变了（比如诊断文字、服务列表）之后调用，
+    /// 不能在 layout() 里调用。
+    func measure() {
+        sizes = items.map { view in
+            let fitting = view.fittingSize
+            return NSSize(width: ceil(fitting.width), height: ceil(fitting.height))
+        }
+        needsLayout = true
     }
 
     /// 所有栏放在一行时需要的宽度。
     var widthForAllInOneRow: CGFloat {
-        items.reduce(0) { $0 + size(of: $1).width } + minGap * CGFloat(max(0, items.count - 1))
+        sizes.reduce(0) { $0 + $1.width } + minGap * CGFloat(max(0, sizes.count - 1))
     }
 
     /// 最宽的一栏（窗口最窄只能缩到这么宽）。
     var widestItem: CGFloat {
-        items.map { size(of: $0).width }.max() ?? 300
+        sizes.map(\.width).max() ?? 300
     }
 
     struct Arrangement {
@@ -528,7 +538,10 @@ final class AdaptiveColumnsView: NSView {
     }
 
     func arrangement(forWidth width: CGFloat) -> Arrangement {
-        let sizes = items.map(size(of:))
+        let sizes = self.sizes
+        guard sizes.count == items.count, !sizes.isEmpty else {
+            return Arrangement(frames: [], separators: [], height: 0)
+        }
         // 按顺序装行：当前行放不下下一栏就换行
         var rows: [[Int]] = []
         var current: [Int] = []
@@ -550,9 +563,8 @@ final class AdaptiveColumnsView: NSView {
         var separators: [NSRect] = []
         var y: CGFloat = 0
         for (rowIndex, row) in rows.enumerated() {
-            let rowWidths = row.map { sizes[$0].width }
             let rowHeight = row.map { sizes[$0].height }.max() ?? 0
-            let total = rowWidths.reduce(0, +)
+            let total = row.map { sizes[$0].width }.reduce(0, +)
             // 一行多栏时把剩余宽度平均分到栏间距里（最多加宽到 120），看起来更均衡
             let gap = row.count > 1
                 ? min(120, max(minGap, (width - total) / CGFloat(row.count - 1)))
@@ -578,11 +590,13 @@ final class AdaptiveColumnsView: NSView {
     override func layout() {
         super.layout()
         let result = arrangement(forWidth: bounds.width)
-        for (view, frame) in zip(items, result.frames) {
+        for (view, frame) in zip(items, result.frames) where view.frame != frame {
             view.frame = frame
         }
-        separators = result.separators
-        needsDisplay = true
+        if separators != result.separators {
+            separators = result.separators
+            needsDisplay = true
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -772,19 +786,28 @@ final class DisplaySettingsViewController: NSViewController {
     }
 
     private var clipObserver: NSObjectProtocol?
+    private var isRelayouting = false
 
     /// 窗口大小变了：按新宽度重新排列栏，并更新可滚动的高度。
+    /// 只在尺寸真的变了时才改，并防止重入，避免排版死循环。
     private func relayout() {
-        guard let scroll = view as? NSScrollView else { return }
+        guard !isRelayouting, let scroll = view as? NSScrollView else { return }
+        isRelayouting = true
+        defer { isRelayouting = false }
         let width = scroll.contentView.bounds.width
         guard width > 0 else { return }
         let height = max(documentView.height(forWidth: width), scroll.contentView.bounds.height)
-        documentView.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        let frame = NSRect(x: 0, y: 0, width: width, height: height)
+        if abs(documentView.frame.width - frame.width) > 0.5 || abs(documentView.frame.height - frame.height) > 0.5 {
+            documentView.frame = frame
+        }
         documentView.needsLayout = true
     }
 
-    override func viewDidLayout() {
-        super.viewDidLayout()
+    /// 内容变了（服务列表、诊断文字）后重新量尺寸再排版。
+    private func remeasure() {
+        guard isViewLoaded else { return }
+        columnsView.measure()
         relayout()
     }
 
@@ -937,6 +960,8 @@ final class DisplaySettingsViewController: NSViewController {
         """
         addFrontAppButton.isHidden = Diagnostics.lastAppBundleID == nil || Diagnostics.lastAppIsMusic
         addFrontAppButton.title = "把「\(Diagnostics.lastAppName ?? "它")」加入音乐 App 列表…"
+        // 诊断文字和按钮长度变了，栏宽可能跟着变
+        remeasure()
     }
 
     @objc private func addFrontApp(_ sender: Any?) {

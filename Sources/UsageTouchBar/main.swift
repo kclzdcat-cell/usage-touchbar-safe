@@ -130,8 +130,9 @@ enum UsageFormat {
 struct AuthState {
     let connectedProviders: Set<Provider>
 
+    /// 只看你选择显示的服务：隐藏掉的服务（比如没用的 OpenCode）没登录，不再弹登录窗口。
     var requiresLogin: Bool {
-        !Provider.allCases.allSatisfy { connectedProviders.contains($0) }
+        !AppConfig.shared.orderedVisibleProviders.allSatisfy { connectedProviders.contains($0) }
     }
 
     func isConnected(_ provider: Provider) -> Bool {
