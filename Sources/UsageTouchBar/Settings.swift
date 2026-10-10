@@ -394,6 +394,7 @@ final class TouchBarContentHost: NSView {
 @MainActor
 final class SettingsWindowController: NSWindowController {
     private let settingsVC: DisplaySettingsViewController
+    private var screenObserver: NSObjectProtocol?
 
     init(onChange: @escaping () -> Void,
          onArrange: @escaping ([(provider: Provider, enabled: Bool)]) -> Void) {
@@ -403,10 +404,15 @@ final class SettingsWindowController: NSWindowController {
         window.title = "Usage Touch Bar 设置"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.isReleasedWhenClosed = false
-        window.contentMinSize = NSSize(width: 520, height: 360)
+        window.contentMinSize = settingsVC.minimumSize
         window.setContentSize(settingsVC.idealSize)
-        window.setFrameAutosaveName("UsageTouchBarSettings.v3")
+        window.setFrameAutosaveName("UsageTouchBarSettings.v4")
         super.init(window: window)
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.fitToScreen() }
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -415,15 +421,175 @@ final class SettingsWindowController: NSWindowController {
 
     func present() {
         settingsVC.reload()
-        if window?.isVisible != true { window?.center() }
+        if window?.isVisible != true {
+            fitToScreen()
+            window?.center()
+        }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
+
+    /// 换了显示器或改了分辨率后，窗口不超出屏幕。
+    func fitToScreen() {
+        guard let window, let screen = window.screen ?? NSScreen.main else { return }
+        let visible = screen.visibleFrame
+        var frame = window.frame
+        frame.size.width = min(frame.width, visible.width - 20)
+        frame.size.height = min(frame.height, visible.height - 20)
+        frame.origin.x = min(max(frame.minX, visible.minX + 10), visible.maxX - frame.width - 10)
+        frame.origin.y = min(max(frame.minY, visible.minY + 10), visible.maxY - frame.height - 10)
+        window.setFrame(frame, display: true, animate: false)
+    }
 }
 
-/// 让滚动区域的内容从左上角开始排。
-private final class FlippedView: NSView {
+/// 设置窗口的滚动内容：上面是自适应的几栏，下面是一行状态提示。
+@MainActor
+final class SettingsDocumentView: NSView {
+    static let margin: CGFloat = 28
+    var columns: AdaptiveColumnsView? {
+        didSet {
+            oldValue?.removeFromSuperview()
+            if let columns { addSubview(columns) }
+        }
+    }
+    var footer: NSTextField? {
+        didSet {
+            oldValue?.removeFromSuperview()
+            if let footer { addSubview(footer) }
+        }
+    }
+
     override var isFlipped: Bool { true }
+
+    func height(forWidth width: CGFloat) -> CGFloat {
+        let inner = max(10, width - Self.margin * 2)
+        let columnsHeight = columns?.arrangement(forWidth: inner).height ?? 0
+        footer?.preferredMaxLayoutWidth = inner
+        let footerHeight = footer?.fittingSize.height ?? 0
+        return 22 + columnsHeight + 20 + footerHeight + 22
+    }
+
+    override func layout() {
+        super.layout()
+        let inner = max(10, bounds.width - Self.margin * 2)
+        var y: CGFloat = 22
+        if let columns {
+            let height = columns.arrangement(forWidth: inner).height
+            columns.frame = NSRect(x: Self.margin, y: y, width: inner, height: height)
+            y += height + 20
+        }
+        if let footer {
+            footer.preferredMaxLayoutWidth = inner
+            footer.frame = NSRect(x: Self.margin, y: y, width: inner, height: footer.fittingSize.height)
+        }
+    }
+}
+
+/// 自适应分栏：按可用宽度决定一行放几栏（3 → 2 → 1），放不下就换行；
+/// 同一行的栏顶部对齐，多出来的空间平均分到栏之间，栏之间画分隔线。
+@MainActor
+final class AdaptiveColumnsView: NSView {
+    private var items: [NSView] = []
+    private var separators: [NSRect] = []
+    private let minGap: CGFloat = 44
+    private let rowGap: CGFloat = 30
+
+    override var isFlipped: Bool { true }
+
+    func setItems(_ views: [NSView]) {
+        items.forEach { $0.removeFromSuperview() }
+        items = views
+        for view in views {
+            view.translatesAutoresizingMaskIntoConstraints = true
+            addSubview(view)
+        }
+        needsLayout = true
+    }
+
+    private func size(of view: NSView) -> NSSize {
+        let fitting = view.fittingSize
+        return NSSize(width: ceil(fitting.width), height: ceil(fitting.height))
+    }
+
+    /// 所有栏放在一行时需要的宽度。
+    var widthForAllInOneRow: CGFloat {
+        items.reduce(0) { $0 + size(of: $1).width } + minGap * CGFloat(max(0, items.count - 1))
+    }
+
+    /// 最宽的一栏（窗口最窄只能缩到这么宽）。
+    var widestItem: CGFloat {
+        items.map { size(of: $0).width }.max() ?? 300
+    }
+
+    struct Arrangement {
+        var frames: [NSRect]
+        var separators: [NSRect]
+        var height: CGFloat
+    }
+
+    func arrangement(forWidth width: CGFloat) -> Arrangement {
+        let sizes = items.map(size(of:))
+        // 按顺序装行：当前行放不下下一栏就换行
+        var rows: [[Int]] = []
+        var current: [Int] = []
+        var used: CGFloat = 0
+        for (index, itemSize) in sizes.enumerated() {
+            let needed = current.isEmpty ? itemSize.width : used + minGap + itemSize.width
+            if !current.isEmpty && needed > width {
+                rows.append(current)
+                current = [index]
+                used = itemSize.width
+            } else {
+                current.append(index)
+                used = needed
+            }
+        }
+        if !current.isEmpty { rows.append(current) }
+
+        var frames = Array(repeating: NSRect.zero, count: items.count)
+        var separators: [NSRect] = []
+        var y: CGFloat = 0
+        for (rowIndex, row) in rows.enumerated() {
+            let rowWidths = row.map { sizes[$0].width }
+            let rowHeight = row.map { sizes[$0].height }.max() ?? 0
+            let total = rowWidths.reduce(0, +)
+            // 一行多栏时把剩余宽度平均分到栏间距里（最多加宽到 120），看起来更均衡
+            let gap = row.count > 1
+                ? min(120, max(minGap, (width - total) / CGFloat(row.count - 1)))
+                : 0
+            var x: CGFloat = 0
+            for (position, index) in row.enumerated() {
+                if position > 0 {
+                    separators.append(NSRect(x: x - gap / 2, y: y, width: 1, height: rowHeight))
+                }
+                frames[index] = NSRect(x: x, y: y, width: sizes[index].width, height: sizes[index].height)
+                x += sizes[index].width + gap
+            }
+            y += rowHeight
+            if rowIndex < rows.count - 1 {
+                // 行与行之间画一条横线
+                separators.append(NSRect(x: 0, y: y + rowGap / 2, width: width, height: 1))
+                y += rowGap
+            }
+        }
+        return Arrangement(frames: frames, separators: separators, height: y)
+    }
+
+    override func layout() {
+        super.layout()
+        let result = arrangement(forWidth: bounds.width)
+        for (view, frame) in zip(items, result.frames) {
+            view.frame = frame
+        }
+        separators = result.separators
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor.separatorColor.setFill()
+        for rect in separators { rect.fill() }
+    }
 }
 
 @MainActor
@@ -464,7 +630,8 @@ final class DisplaySettingsViewController: NSViewController {
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let diagnosticsLabel = NSTextField(wrappingLabelWithString: "")
     private let addFrontAppButton = NSButton(title: "把它加入音乐 App 列表", target: nil, action: nil)
-    private let content = NSStackView()
+    private let columnsView = AdaptiveColumnsView()
+    private let documentView = SettingsDocumentView()
     private var diagnosticsObserver: NSObjectProtocol?
 
     private var arrangement: [(provider: Provider, enabled: Bool)] = []
@@ -487,13 +654,20 @@ final class DisplaySettingsViewController: NSViewController {
         fatalError("init(coder:) has not been implemented")
     }
 
-    /// 窗口第一次打开时的大小：刚好放下全部内容（横向两栏）。
+    /// 窗口第一次打开时的大小：按屏幕分辨率挑一个能放下最多栏的宽度。
     var idealSize: NSSize {
         _ = view
-        let fitting = content.fittingSize
         let screen = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1400, height: 800)
-        return NSSize(width: min(fitting.width + 48, screen.width - 40),
-                      height: min(fitting.height + 40, screen.height - 60))
+        let width = min(columnsView.widthForAllInOneRow + SettingsDocumentView.margin * 2, screen.width - 40)
+        let height = documentView.height(forWidth: width)
+        return NSSize(width: max(minimumSize.width, width),
+                      height: min(max(360, height), screen.height - 60))
+    }
+
+    /// 最窄能缩到只剩一栏。
+    var minimumSize: NSSize {
+        _ = view
+        return NSSize(width: columnsView.widestItem + SettingsDocumentView.margin * 2, height: 360)
     }
 
     override func loadView() {
@@ -556,53 +730,12 @@ final class DisplaySettingsViewController: NSViewController {
             .full(addFrontAppButton),
         ])
 
-        // 三栏都贴着顶部排，栏之间用分隔线
-        let columns = NSView()
-        let grids = [column1, column2, column3]
-        var constraints: [NSLayoutConstraint] = []
-        var previous: NSView?
-        for (index, grid) in grids.enumerated() {
-            grid.translatesAutoresizingMaskIntoConstraints = false
-            columns.addSubview(grid)
-            constraints += [
-                grid.topAnchor.constraint(equalTo: columns.topAnchor),
-                grid.bottomAnchor.constraint(lessThanOrEqualTo: columns.bottomAnchor),
-            ]
-            if let previous {
-                let divider = NSBox()
-                divider.boxType = .separator
-                divider.translatesAutoresizingMaskIntoConstraints = false
-                columns.addSubview(divider)
-                constraints += [
-                    divider.leadingAnchor.constraint(equalTo: previous.trailingAnchor, constant: 24),
-                    divider.topAnchor.constraint(equalTo: columns.topAnchor),
-                    divider.bottomAnchor.constraint(equalTo: columns.bottomAnchor),
-                    divider.widthAnchor.constraint(equalToConstant: 1),
-                    grid.leadingAnchor.constraint(equalTo: divider.trailingAnchor, constant: 24),
-                ]
-            } else {
-                constraints.append(grid.leadingAnchor.constraint(equalTo: columns.leadingAnchor))
-            }
-            if index == grids.count - 1 {
-                constraints.append(grid.trailingAnchor.constraint(equalTo: columns.trailingAnchor))
-            }
-            previous = grid
-        }
-        // 栏的高度取最高的那一栏
-        let tallest = columns.heightAnchor.constraint(equalToConstant: 0)
-        tallest.priority = .defaultLow
-        constraints.append(tallest)
-        NSLayoutConstraint.activate(constraints)
+        // 自适应：窗口够宽三栏并排，窄一些自动换成两栏、一栏
+        columnsView.setItems([column1, column2, column3])
 
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = "修改后立即生效，保存在 ~/.config/usage-touchbar/config.json。"
-
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 16
-        content.addArrangedSubview(columns)
-        content.addArrangedSubview(statusLabel)
 
         diagnosticsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         diagnosticsLabel.preferredMaxLayoutWidth = 300
@@ -615,36 +748,44 @@ final class DisplaySettingsViewController: NSViewController {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateDiagnostics() }
         }
-        content.translatesAutoresizingMaskIntoConstraints = false
-
-        // 放进滚动区域：窗口可以随意拉大缩小，缩小时可以滚动查看。
-        let document = FlippedView()
-        document.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(content)
+        // 放进滚动区域：内容宽度永远跟着窗口走，只在高度放不下时上下滚动
+        documentView.columns = columnsView
+        documentView.footer = statusLabel
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = true
+        scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers = true
         scroll.drawsBackground = false
-        scroll.documentView = document
-
-        let clip = scroll.contentView
-        NSLayoutConstraint.activate([
-            content.topAnchor.constraint(equalTo: document.topAnchor, constant: 20),
-            content.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 24),
-            content.trailingAnchor.constraint(lessThanOrEqualTo: document.trailingAnchor, constant: -24),
-            content.bottomAnchor.constraint(lessThanOrEqualTo: document.bottomAnchor, constant: -20),
-            document.topAnchor.constraint(equalTo: clip.topAnchor),
-            document.leadingAnchor.constraint(equalTo: clip.leadingAnchor),
-            document.widthAnchor.constraint(greaterThanOrEqualTo: clip.widthAnchor),
-            document.heightAnchor.constraint(greaterThanOrEqualTo: clip.heightAnchor),
-        ])
-        statusLabel.preferredMaxLayoutWidth = 700
+        scroll.documentView = documentView
+        scroll.contentView.postsFrameChangedNotifications = true
+        clipObserver = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification, object: scroll.contentView, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.relayout() }
+        }
 
         scroll.frame = NSRect(x: 0, y: 0, width: 900, height: 600)
         view = scroll
         reload()
+        relayout()
+    }
+
+    private var clipObserver: NSObjectProtocol?
+
+    /// 窗口大小变了：按新宽度重新排列栏，并更新可滚动的高度。
+    private func relayout() {
+        guard let scroll = view as? NSScrollView else { return }
+        let width = scroll.contentView.bounds.width
+        guard width > 0 else { return }
+        let height = max(documentView.height(forWidth: width), scroll.contentView.bounds.height)
+        documentView.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        documentView.needsLayout = true
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        relayout()
     }
 
     private func makeGrid(_ rows: [Row]) -> NSGridView {
