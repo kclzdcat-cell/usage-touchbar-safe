@@ -2324,6 +2324,31 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     /// 是否正占着别的程序（比如输入法）的 Control Strip 位置。
     private var holdingStripSlot = false
+    /// 在音乐 App 里时定期重新申请位置：输入法（如搜狗）每次切换 App 都会被系统重新激活、
+    /// 重新申请位置，比我们晚一步就会把图标挤掉。
+    private var stripReclaimTimer: Timer?
+
+    private func startStripReclaimLoop() {
+        stripReclaimTimer?.invalidate()
+        // 切换后输入法会稍晚一点重新申请，所以分几次补申请
+        for delay in [0.4, 1.2, 2.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.musicAppActive else { return }
+                self.reclaimControlStripIfWanted()
+            }
+        }
+        stripReclaimTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.musicAppActive else { return }
+                self.reclaimControlStripIfWanted()
+            }
+        }
+    }
+
+    private func stopStripReclaimLoop() {
+        stripReclaimTimer?.invalidate()
+        stripReclaimTimer = nil
+    }
 
     /// 按设置决定要不要顶替 Control Strip 上别的程序的图标：
     /// - 只在音乐 App 里：进音乐 App 时顶替，离开时让出来，输入法等图标会回来
@@ -2365,10 +2390,14 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             // 收起铺满整条的用量栏，让音乐 App 的歌词显示出来
             restoreExpandedAfterMusic = touchBar.isVisible || config.resolvedPlacement == .pinned
             ControlStrip.dismissModal(touchBar)
+            if config.resolvedStripSlotPolicy != .never, config.resolvedMusicMode == .iconOnly {
+                startStripReclaimLoop()
+            }
             if config.resolvedMusicMode == .hide, let controlStripItem {
                 ControlStrip.setVisible(controlStripItem, false)
             }
         } else {
+            stopStripReclaimLoop()
             if let controlStripItem, AppConfig.shared.resolvedStripSlotPolicy != .musicOnly {
                 ControlStrip.setVisible(controlStripItem, true)
             }
@@ -2490,6 +2519,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         timer = nil
         pinTimer?.invalidate()
         pinTimer = nil
+        stopStripReclaimLoop()
         if let appActivationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
         }
