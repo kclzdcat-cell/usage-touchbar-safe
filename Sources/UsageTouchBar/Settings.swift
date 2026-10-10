@@ -98,6 +98,17 @@ enum IconSizeOption: String, CaseIterable {
     }
 }
 
+enum StripSlotPolicy: String, CaseIterable {
+    case musicOnly, always, never
+    var title: String {
+        switch self {
+        case .musicOnly: "只在音乐 App 里顶替（离开后还给输入法等）"
+        case .always: "一直占用"
+        case .never: "从不占用"
+        }
+    }
+}
+
 enum MusicMode: String, CaseIterable {
     case off, hide, iconOnly
     var title: String {
@@ -193,7 +204,9 @@ extension AppConfig {
     var resolvedShowSecondaryMetric: Bool { showSecondaryMetric ?? true }
     var resolvedShowMenuBar: Bool { showMenuBar ?? true }
     var resolvedShowInDock: Bool { showInDock ?? true }
-    var resolvedReclaimControlStrip: Bool { reclaimControlStrip ?? true }
+    var resolvedStripSlotPolicy: StripSlotPolicy {
+        stripSlotPolicy.flatMap(StripSlotPolicy.init(rawValue:)) ?? .musicOnly
+    }
     /// 菜单栏和 Touch Bar 按钮不能同时隐藏，否则就没有入口打开设置了。
     var resolvedShowTouchBarButtons: Bool { (showTouchBarButtons ?? true) || !resolvedShowMenuBar }
     var resolvedWarnThreshold: Double { warnThreshold ?? 60 }
@@ -429,7 +442,7 @@ final class DisplaySettingsViewController: NSViewController {
     private let buttonsSwitch = NSSwitch()
     private let menuBarSwitch = NSSwitch()
     private let dockSwitch = NSSwitch()
-    private let reclaimSwitch = NSSwitch()
+    private let slotPopup = NSPopUpButton()
     private let loginSwitch = NSSwitch()
     private let providerStack = NSStackView()
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
@@ -476,7 +489,6 @@ final class DisplaySettingsViewController: NSViewController {
             .item("显示位置：", placementPopup),
             .item("展开后内容：", alignPopup),
             .item("Control Strip 样式：", stripStylePopup),
-            .item("抢占 Control Strip 位置：", reclaimSwitch),
             .item("刷新 / 设置按钮：", buttonsSwitch),
             .section("显示内容"),
             .item("主要显示：", metricPopup),
@@ -513,6 +525,7 @@ final class DisplaySettingsViewController: NSViewController {
             .item("", resetColors),
             .section("音乐 App（歌词）"),
             .item("音乐 App 在前台时：", musicModePopup),
+            .item("Control Strip 图标位置：", slotPopup),
             .item("对这些 App 生效：", musicApps),
             .item("其他 App：", customMusicField),
             .full(musicTip),
@@ -624,7 +637,7 @@ final class DisplaySettingsViewController: NSViewController {
             gridRow.rowAlignment = .none
             if sectionRows.contains(index) && index > 0 { gridRow.topPadding = 10 }
         }
-        for control in [resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, loginSwitch, reclaimSwitch,
+        for control in [resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, loginSwitch,
                         nameColorWell, percentColorWell, detailColorWell] as [NSView] {
             if let cell = grid.cell(for: control) {
                 cell.yPlacement = .center
@@ -644,6 +657,7 @@ final class DisplaySettingsViewController: NSViewController {
         dangerPopup.addItems(withTitles: dangerChoices.map { "\(Int($0))%" })
         intervalPopup.addItems(withTitles: intervalChoices.map(\.title))
         musicModePopup.addItems(withTitles: MusicMode.allCases.map(\.title))
+        slotPopup.addItems(withTitles: StripSlotPolicy.allCases.map(\.title))
 
         fontSizeControl.segmentCount = FontSizeOption.allCases.count
         for (i, option) in FontSizeOption.allCases.enumerated() { fontSizeControl.setLabel(option.title, forSegment: i) }
@@ -671,7 +685,7 @@ final class DisplaySettingsViewController: NSViewController {
                         warnPopup, dangerPopup, intervalPopup, musicModePopup,
                         fontSizeControl, iconSizeControl,
                         nameColorWell, percentColorWell, detailColorWell, customMusicField,
-                        resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, reclaimSwitch] as [NSControl] {
+                        resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, slotPopup] as [NSControl] {
             control.target = self
             control.action = #selector(valueChanged(_:))
         }
@@ -713,7 +727,7 @@ final class DisplaySettingsViewController: NSViewController {
         buttonsSwitch.state = (config.showTouchBarButtons ?? true) ? .on : .off
         menuBarSwitch.state = config.resolvedShowMenuBar ? .on : .off
         dockSwitch.state = config.resolvedShowInDock ? .on : .off
-        reclaimSwitch.state = config.resolvedReclaimControlStrip ? .on : .off
+        slotPopup.selectItem(at: StripSlotPolicy.allCases.firstIndex(of: config.resolvedStripSlotPolicy) ?? 0)
         loginSwitch.state = LaunchAtLogin.isEnabled ? .on : .off
         updateMusicControlsEnabled()
         arrangement = config.arrangement
@@ -749,6 +763,7 @@ final class DisplaySettingsViewController: NSViewController {
     private func updateMusicControlsEnabled() {
         let enabled = musicModePopup.indexOfSelectedItem > 0
         musicAppChecks.forEach { $0.isEnabled = enabled }
+        slotPopup.isEnabled = enabled
         customMusicField.isEnabled = enabled
     }
 
@@ -868,7 +883,7 @@ final class DisplaySettingsViewController: NSViewController {
         config.showTouchBarButtons = buttonsSwitch.state == .on
         config.showMenuBar = menuBarSwitch.state == .on
         config.showInDock = dockSwitch.state == .on
-        config.reclaimControlStrip = reclaimSwitch.state == .on
+        config.stripSlotPolicy = StripSlotPolicy.allCases[max(0, slotPopup.indexOfSelectedItem)].rawValue
         updateMusicControlsEnabled()
 
         var notes: [String] = []

@@ -737,7 +737,7 @@ struct AppConfig: Codable {
     var refreshInterval: Double?
     var showMenuBar: Bool?
     var showInDock: Bool?
-    var reclaimControlStrip: Bool?
+    var stripSlotPolicy: String?      // StripSlotPolicy.rawValue
     var fontSize: String?             // FontSizeOption.rawValue
     var iconSize: String?             // IconSizeOption.rawValue
     var nameColor: String?            // "#RRGGBB"，服务名称
@@ -2322,11 +2322,28 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         frontmostAppChanged(to: front?.bundleIdentifier, name: front?.localizedName)
     }
 
-    /// 每次切换 App、每次刷新都重新申请 Control Strip 位置（“隐藏”模式下在音乐 App 里除外）。
+    /// 是否正占着别的程序（比如输入法）的 Control Strip 位置。
+    private var holdingStripSlot = false
+
+    /// 按设置决定要不要顶替 Control Strip 上别的程序的图标：
+    /// - 只在音乐 App 里：进音乐 App 时顶替，离开时让出来，输入法等图标会回来
+    /// - 一直占用：每次切换 App、刷新时都重新申请
+    /// - 从不：不主动申请
     private func reclaimControlStripIfWanted() {
-        guard let controlStripItem, ControlStrip.isSupported,
-              AppConfig.shared.resolvedReclaimControlStrip, !hiddenForMusic else { return }
-        ControlStrip.reclaim(controlStripItem)
+        guard let controlStripItem, ControlStrip.isSupported else { return }
+        let want: Bool
+        switch AppConfig.shared.resolvedStripSlotPolicy {
+        case .musicOnly: want = musicAppActive && !hiddenForMusic
+        case .always: want = !hiddenForMusic
+        case .never: want = false
+        }
+        if want {
+            ControlStrip.reclaim(controlStripItem)
+            holdingStripSlot = true
+        } else if holdingStripSlot {
+            ControlStrip.setVisible(controlStripItem, false)
+            holdingStripSlot = false
+        }
     }
 
     /// 前台 App 变了：进入音乐 App 时让出 Touch Bar，离开后恢复。
@@ -2352,7 +2369,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
                 ControlStrip.setVisible(controlStripItem, false)
             }
         } else {
-            if let controlStripItem {
+            if let controlStripItem, AppConfig.shared.resolvedStripSlotPolicy != .musicOnly {
                 ControlStrip.setVisible(controlStripItem, true)
             }
             if restoreExpandedAfterMusic, ControlStrip.isSupported {
@@ -3083,6 +3100,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         controlStripItem = item
         controlStripButton = button
         ControlStrip.add(item)
+        // add 会占用 Control Strip 位置；标记一下，之后按设置决定要不要让出来
+        holdingStripSlot = true
         if ownedProvider == nil, AppConfig.shared.resolvedPlacement != .controlStripOnly {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 guard let self, !self.musicAppActive else { return }
