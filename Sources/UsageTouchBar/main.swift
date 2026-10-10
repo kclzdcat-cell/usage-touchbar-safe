@@ -737,6 +737,14 @@ struct AppConfig: Codable {
     var refreshInterval: Double?
     var showMenuBar: Bool?
     var showInDock: Bool?
+    var fontSize: String?             // FontSizeOption.rawValue
+    var iconSize: String?             // IconSizeOption.rawValue
+    var nameColor: String?            // "#RRGGBB"，服务名称
+    var percentColor: String?         // 百分比数字
+    var detailColor: String?          // 套餐、倒计时、5h/W 标签
+    var musicMode: String?            // MusicMode.rawValue
+    var musicApps: [String]?          // 生效的音乐 App bundle id
+    var customMusicApps: String?      // 用户自己填的 bundle id（逗号分隔）
 
     /// Mutable so the Arrange window can apply changes without a relaunch.
     nonisolated(unsafe) static var shared = load()
@@ -1905,27 +1913,17 @@ final class UsageBarView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 82, height: 30) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 96 * TouchBarStyle.scale, height: 30) }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let captionAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9, weight: .medium),
-            .foregroundColor: NSColor.tertiaryLabelColor
-        ]
-        let valueAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold),
-            .foregroundColor: NSColor.labelColor
-        ]
-        let resetAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 7.5, weight: .regular),
-            .foregroundColor: NSColor.tertiaryLabelColor.withAlphaComponent(0.7)
-        ]
+        let captionAttrs = TouchBarStyle.captionAttributes
+        let valueAttrs = TouchBarStyle.valueAttributes
+        let resetAttrs = TouchBarStyle.resetAttributes
 
         let hasReset = (reset != nil)
-        let topLineY: CGFloat = hasReset ? 18 : (bounds.height - 9) / 2
-        let topMidY = topLineY + 4.5
+        let topMidY: CGFloat = hasReset ? bounds.height * 0.68 : bounds.height / 2
 
         let captionSize = caption.size(withAttributes: captionAttrs)
         caption.draw(at: NSPoint(x: 0, y: topMidY - captionSize.height / 2), withAttributes: captionAttrs)
@@ -2026,7 +2024,7 @@ final class StackedUsageBarView: NSView {
     /// Narrow enough that two providers plus their icon+name still fit on a
     /// 13" Touch Bar with breathing room, but wide enough that the bar track
     /// itself never collapses below ~70pt.
-    override var intrinsicContentSize: NSSize { NSSize(width: 130, height: 30) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 150 * TouchBarStyle.scale, height: 30) }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -2041,18 +2039,9 @@ final class StackedUsageBarView: NSView {
     }
 
     private func drawBar(_ bar: UsageBar, in row: NSRect, drawReset: Bool) {
-        let captionAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9, weight: .medium),
-            .foregroundColor: NSColor.tertiaryLabelColor
-        ]
-        let valueAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold),
-            .foregroundColor: NSColor.labelColor
-        ]
-        let resetAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 7.5, weight: .regular),
-            .foregroundColor: NSColor.tertiaryLabelColor.withAlphaComponent(0.7)
-        ]
+        let captionAttrs = TouchBarStyle.captionAttributes
+        let valueAttrs = TouchBarStyle.valueAttributes
+        let resetAttrs = TouchBarStyle.resetAttributes
 
         let midY = row.midY
 
@@ -2158,6 +2147,11 @@ enum ControlStrip {
         _ = (NSTouchBarItem.self as AnyObject).perform(sel, with: item)
     }
 
+    /// 暂时隐藏 / 恢复 Control Strip 图标（不删除，避免删了加不回来）。
+    static func setVisible(_ item: NSTouchBarItem, _ visible: Bool) {
+        setPresent(item.identifier, visible)
+    }
+
     private static func setPresent(_ identifier: NSTouchBarItem.Identifier, _ present: Bool) {
         symbol("DFRElementSetControlStripPresenceForIdentifier", as: PresenceFn.self)?(
             identifier.rawValue as NSString, present
@@ -2236,6 +2230,11 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private var appliedPlacement = AppConfig.shared.resolvedPlacement
     /// 只有双击打开的 App 才显示 Dock 图标；命令行 `--touchbar` 模式不显示。
     var allowsDockIcon = false
+    /// 音乐 App（QQ音乐、网易云音乐等）在前台时为 true。
+    private var musicAppActive = false
+    /// 进入音乐 App 前是否处于展开状态，离开后用来恢复。
+    private var restoreExpandedAfterMusic = false
+    private var appActivationObserver: NSObjectProtocol?
     private let popover = NSPopover()
     private let loginWindow = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: 420, height: 320),
@@ -2290,8 +2289,50 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         }
         updateCodexSessionWatcher()
         updateOpenCodeDBWatcher()
+        startFrontmostAppWatcher()
         refresh()
         restartTimers()
+    }
+
+    // MARK: 音乐 App 适配
+
+    private func startFrontmostAppWatcher() {
+        appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let bundleID = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
+            MainActor.assumeIsolated { self?.frontmostAppChanged(to: bundleID) }
+        }
+        frontmostAppChanged(to: NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+    }
+
+    /// 前台 App 变了：进入音乐 App 时让出 Touch Bar，离开后恢复。
+    private func frontmostAppChanged(to bundleID: String?) {
+        let config = AppConfig.shared
+        let isMusic = config.resolvedMusicMode != .off
+            && bundleID.map { config.resolvedMusicApps.contains($0) } == true
+        guard isMusic != musicAppActive else { return }
+        musicAppActive = isMusic
+
+        if isMusic {
+            // 收起铺满整条的用量栏，让音乐 App 的歌词显示出来
+            restoreExpandedAfterMusic = touchBar.isVisible || config.resolvedPlacement == .pinned
+            ControlStrip.dismissModal(touchBar)
+            if config.resolvedMusicMode == .hide, let controlStripItem {
+                ControlStrip.setVisible(controlStripItem, false)
+            }
+        } else {
+            if let controlStripItem {
+                ControlStrip.setVisible(controlStripItem, true)
+            }
+            if restoreExpandedAfterMusic, ControlStrip.isSupported {
+                ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
+            }
+            restoreExpandedAfterMusic = false
+        }
+        refreshTouchBar()
     }
 
     /// 按配置的刷新间隔重建定时器；“常驻展开”模式额外每 3 秒检查一次是否被收起。
@@ -2310,7 +2351,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     private func keepPinnedTouchBarVisible() {
-        guard AppConfig.shared.resolvedPlacement == .pinned, !touchBar.isVisible else { return }
+        guard AppConfig.shared.resolvedPlacement == .pinned, !musicAppActive, !touchBar.isVisible else { return }
         ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
     }
 
@@ -2326,7 +2367,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
         // 只在“显示位置”真的变了时才展开 / 收起，避免每次改设置都闪一下。
         let placement = config.resolvedPlacement
-        if placement != appliedPlacement, ControlStrip.isSupported {
+        if placement != appliedPlacement, ControlStrip.isSupported, !musicAppActive {
             if placement == .controlStripOnly {
                 ControlStrip.dismissModal(touchBar)
             } else {
@@ -2334,6 +2375,13 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             }
         }
         appliedPlacement = placement
+        // 音乐 App 设置可能变了，按当前前台 App 重新判断一次
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        if musicAppActive {
+            musicAppActive = false
+            if let controlStripItem { ControlStrip.setVisible(controlStripItem, true) }
+        }
+        frontmostAppChanged(to: front)
     }
 
     /// 是否在 Dock 显示图标。显示时需要一个最简单的 App 菜单，否则屏幕顶部菜单栏是空的。
@@ -2397,6 +2445,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         timer = nil
         pinTimer?.invalidate()
         pinTimer = nil
+        if let appActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
+        }
+        appActivationObserver = nil
         teardownCodexSessionWatcher()
         teardownOpenCodeDBWatcher()
         teardownControlStripItem()
@@ -2657,7 +2709,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 3
+        row.spacing = 5
         row.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
         row.translatesAutoresizingMaskIntoConstraints = false
 
@@ -2666,11 +2718,12 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             let snapshot = snapshots[provider]
 
             // Brand icon.
-            let icon = NSImageView(image: ProviderBranding.icon(for: provider, size: 18))
+            let iconSide = TouchBarStyle.iconSize
+            let icon = NSImageView(image: ProviderBranding.icon(for: provider, size: iconSide))
             icon.imageScaling = .scaleProportionallyUpOrDown
             icon.translatesAutoresizingMaskIntoConstraints = false
-            icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
-            icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
+            icon.widthAnchor.constraint(equalToConstant: iconSide).isActive = true
+            icon.heightAnchor.constraint(equalToConstant: iconSide).isActive = true
             row.addArrangedSubview(icon)
 
             // Name + plan stacked.
@@ -2678,9 +2731,9 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             title.orientation = .vertical
             title.alignment = .leading
             title.spacing = 0
-            title.addArrangedSubview(label(provider.symbol, color: .labelColor, bold: true, size: 11))
+            title.addArrangedSubview(label(provider.symbol, color: TouchBarStyle.nameColor, bold: true, size: 12 * TouchBarStyle.scale))
             if let plan = snapshot?.planLabel {
-                title.addArrangedSubview(label(plan.uppercased(), color: .tertiaryLabelColor, bold: false, size: 7))
+                title.addArrangedSubview(label(plan.uppercased(), color: TouchBarStyle.detailColor, bold: true, size: 9 * TouchBarStyle.scale))
             }
             row.addArrangedSubview(title)
 
@@ -2709,7 +2762,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
                     ))
                 }
             } else {
-                row.addArrangedSubview(label(snapshot?.error ?? "—", color: .systemOrange, bold: false, size: 10))
+                row.addArrangedSubview(label(snapshot?.error ?? "—", color: .systemOrange, bold: true, size: 10 * TouchBarStyle.scale))
             }
 
             // Accent-tinted vertical hairline between providers.
@@ -2789,7 +2842,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private func bar(caption: String, percent: Double?, trailing: String, reset: String? = nil) -> UsageBarView {
         let view = UsageBarView(caption: caption, percent: percent, trailing: trailing, reset: reset)
         view.translatesAutoresizingMaskIntoConstraints = false
-        view.widthAnchor.constraint(equalToConstant: 82).isActive = true
+        view.widthAnchor.constraint(equalToConstant: (reset == nil ? 96 : 110) * TouchBarStyle.scale).isActive = true
         view.heightAnchor.constraint(equalToConstant: 30).isActive = true
         return view
     }
@@ -2807,7 +2860,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         secondaryTrailing: String,
         primaryCaption: String = "5h",
         secondaryCaption: String = "Wk",
-        width: CGFloat = 130
+        width: CGFloat = 150 * TouchBarStyle.scale
     ) -> StackedUsageBarView {
         let view = StackedUsageBarView(
             primaryPercent: primaryPercent,
@@ -2827,7 +2880,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private func label(_ text: String, color: NSColor, bold: Bool, size: CGFloat) -> NSTextField {
         let field = NSTextField(labelWithString: text)
         field.textColor = color
-        field.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
+        field.font = .systemFont(ofSize: size, weight: bold ? .semibold : .medium)
         field.lineBreakMode = .byTruncatingTail
         field.maximumNumberOfLines = 1
         return field
@@ -3003,7 +3056,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         ControlStrip.add(item)
         if ownedProvider == nil, AppConfig.shared.resolvedPlacement != .controlStripOnly {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                guard let self else { return }
+                guard let self, !self.musicAppActive else { return }
                 ControlStrip.presentModal(self.touchBar, trayIdentifier: Self.controlStripIdentifier)
             }
         }
@@ -3035,11 +3088,33 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     /// Control Strip 上的图：迷你柱状图（多个服务时）或 图标+数字。
     private func controlStripImage(for providers: [Provider]) -> NSImage {
+        if hiddenForMusic {
+            return NSImage(size: NSSize(width: 1, height: 1))
+        }
+        if iconOnlyForMusic {
+            return makeControlStripImage(for: providers, showNumbers: false)
+        }
         let useNumbers = providers.count <= 1 || AppConfig.shared.resolvedControlStripStyle == .numbers
         return useNumbers ? makeControlStripImage(for: providers) : makeControlStripTriggerImage()
     }
 
+    /// 音乐 App 在前台且选了“只显示 AI 图标”时，Control Strip 只画图标、不画用量。
+    private var iconOnlyForMusic: Bool {
+        musicAppActive && AppConfig.shared.resolvedMusicMode == .iconOnly
+    }
+
+    /// “隐藏”模式：除了让系统隐藏图标，也把图标画成空的，双保险。
+    private var hiddenForMusic: Bool {
+        musicAppActive && AppConfig.shared.resolvedMusicMode == .hide
+    }
+
     private func controlStripButtonWidth(for providers: [Provider], image: NSImage) -> CGFloat {
+        if hiddenForMusic {
+            return 1
+        }
+        if iconOnlyForMusic {
+            return min(120, ceil(image.size.width) + 6)
+        }
         let useNumbers = providers.count <= 1 || AppConfig.shared.resolvedControlStripStyle == .numbers
         guard useNumbers else { return 32 }
         return min(180, max(59, ceil(image.size.width) + 6))
@@ -3067,7 +3142,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             string: text,
             attributes: [
                 .foregroundColor: color,
-                .font: NSFont.systemFont(ofSize: 17, weight: .bold)
+                .font: NSFont.systemFont(ofSize: 17 * min(1.1, TouchBarStyle.scale), weight: .bold)
             ]
         )
     }
@@ -3288,13 +3363,13 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     /// Draws a provider as `[app icon] 13%` into a crisp 2× bitmap.
     /// Uses the real Anthropic / OpenAI app icon, falling back to the `CL`/`CX`
     /// badge if the desktop app isn't installed.
-    private func makeControlStripImage(for providers: [Provider]) -> NSImage {
-        let iconSize: CGFloat = 24
-        let iconGap: CGFloat = 2
-        let providerGap: CGFloat = 5
+    private func makeControlStripImage(for providers: [Provider], showNumbers: Bool = true) -> NSImage {
+        let iconSize: CGFloat = TouchBarStyle.controlStripIconSize
+        let iconGap: CGFloat = showNumbers ? 2 : 0
+        let providerGap: CGFloat = showNumbers ? 5 : 4
 
         let segments = providers.map { provider in
-            let number = controlStripNumber(for: provider)
+            let number = showNumbers ? controlStripNumber(for: provider) : NSAttributedString(string: "")
             let icon = appIcon(for: provider) ?? makeLogoImage(provider: provider, selected: true)
             return (icon: icon, number: number, textSize: number.size())
         }
