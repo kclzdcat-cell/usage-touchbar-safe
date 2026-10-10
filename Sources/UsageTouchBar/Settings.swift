@@ -73,28 +73,31 @@ enum FontSizeOption: String, CaseIterable {
 }
 
 enum IconSizeOption: String, CaseIterable {
-    case small, medium, large
+    case small, medium, large, extraLarge
     var title: String {
         switch self {
         case .small: "小"
         case .medium: "中"
         case .large: "大"
+        case .extraLarge: "特大"
         }
     }
-    /// 展开后用量栏里的图标
+    /// 展开后用量栏里的图标（Touch Bar 高 30，特大就是撑满）
     var detailSide: CGFloat {
         switch self {
-        case .small: 14
-        case .medium: 18
-        case .large: 22
+        case .small: 18
+        case .medium: 22
+        case .large: 26
+        case .extraLarge: 30
         }
     }
     /// Control Strip 上的图标
     var controlStripSide: CGFloat {
         switch self {
         case .small: 20
-        case .medium: 24
-        case .large: 27
+        case .medium: 23
+        case .large: 26
+        case .extraLarge: 29
         }
     }
 }

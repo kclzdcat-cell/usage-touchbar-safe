@@ -1878,12 +1878,25 @@ enum ProviderBranding {
         return workspace.icon(forFile: url.path)
     }
 
+    /// 裁掉 macOS 应用图标四周自带的透明留白（约 10%），让图形本身撑满给定的框。
+    static func croppedAppIcon(for provider: Provider) -> NSImage? {
+        guard let icon = appIcon(for: provider) else { return nil }
+        let side: CGFloat = 128
+        let source = icon.size
+        let inset = 0.095
+        let from = NSRect(x: source.width * inset, y: source.height * inset,
+                          width: source.width * (1 - inset * 2), height: source.height * (1 - inset * 2))
+        return NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            icon.draw(in: rect, from: from, operation: .sourceOver, fraction: 1)
+            return true
+        }
+    }
+
     @MainActor
     static func icon(for provider: Provider, size: CGFloat) -> NSImage {
-        if let appIcon = appIcon(for: provider) {
-            let copy = appIcon.copy() as! NSImage
-            copy.size = NSSize(width: size, height: size)
-            return copy
+        if let cropped = croppedAppIcon(for: provider) {
+            cropped.size = NSSize(width: size, height: size)
+            return cropped
         }
         let view = ProviderLogoView(provider: provider, selected: true)
         view.frame = NSRect(x: 0, y: 0, width: size, height: size)
@@ -3321,7 +3334,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     /// Bundle identifiers / fallback app paths for the providers' desktop apps,
     /// used to source their real brand icons.
     private func appIcon(for provider: Provider) -> NSImage? {
-        ProviderBranding.appIcon(for: provider)
+        ProviderBranding.croppedAppIcon(for: provider)
     }
 
     /// Compact usage number tinted green/orange/red by how full the limit is.
