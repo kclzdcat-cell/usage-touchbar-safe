@@ -298,6 +298,10 @@ enum GeminiCredentials {
         return await refreshToken(refresh, client: client)
     }
 
+    private static func storeToken(_ token: String, expiry: Date) {
+        lock.withLock { memoryToken = (token, expiry) }
+    }
+
     private static func cachedToken() -> String? {
         lock.lock(); defer { lock.unlock() }
         guard let memoryToken, memoryToken.expiry > Date().addingTimeInterval(60) else { return nil }
@@ -331,9 +335,7 @@ enum GeminiCredentials {
               let token = decoded.access_token else {
             return .failed(short: "登录过期", detail: "Gemini 的登录续期失败。在终端运行一次 gemini 重新登录即可。")
         }
-        lock.lock()
-        memoryToken = (token, Date().addingTimeInterval(decoded.expires_in ?? 3000))
-        lock.unlock()
+        storeToken(token, expiry: Date().addingTimeInterval(decoded.expires_in ?? 3000))
         return .ok(token)
     }
 
@@ -390,6 +392,14 @@ struct GeminiUsageCollector: UsageCollecting {
     private static let projectLock = NSLock()
     private nonisolated(unsafe) static var project: (id: String?, tier: String?)?
 
+    private static func knownProject() -> (id: String?, tier: String?)? {
+        projectLock.withLock { project }
+    }
+
+    private static func rememberProject(_ id: String?, _ tier: String?) {
+        projectLock.withLock { project = (id, tier) }
+    }
+
     func collect() async -> UsageSnapshot {
         guard GeminiCredentials.isLoggedIn else { return .disconnected(.gemini) }
         if let fresh = Self.cache.fresh() { return fresh }
@@ -429,9 +439,7 @@ struct GeminiUsageCollector: UsageCollecting {
         }
 
         // 第一次先查一下账号对应的项目和套餐（之后缓存）
-        Self.projectLock.lock()
-        var known = Self.project
-        Self.projectLock.unlock()
+        var known = Self.knownProject()
         if known == nil {
             guard let (data, code) = await post("loadCodeAssist",
                                                 body: ["metadata": ["ideType": "GEMINI_CLI", "pluginType": "GEMINI"]],
@@ -446,9 +454,7 @@ struct GeminiUsageCollector: UsageCollecting {
                 ?? (json?["cloudaicompanionProject"] as? [String: Any])?["id"] as? String
             let tier = (json?["currentTier"] as? [String: Any])?["id"] as? String
             known = (projectID, tier)
-            Self.projectLock.lock()
-            Self.project = known
-            Self.projectLock.unlock()
+            Self.rememberProject(projectID, tier)
         }
 
         var body: [String: Any] = [:]
