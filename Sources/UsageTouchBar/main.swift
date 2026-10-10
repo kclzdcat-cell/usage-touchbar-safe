@@ -590,7 +590,7 @@ struct CodexUsageCollector: UsageCollecting {
         }
         request.setValue("usage-touchbar/1.0", forHTTPHeaderField: "User-Agent")
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
+        guard let (data, response) = try? await SafeNet.data(for: request),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let usage = try? JSONDecoder().decode(APIUsage.self, from: data),
               let rate = usage.rate_limit else {
@@ -964,7 +964,7 @@ struct ClaudeUsageCollector: UsageCollecting {
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
+        guard let (data, response) = try? await SafeNet.data(for: request),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let usage = try? JSONDecoder().decode(LiveUsage.self, from: data) else {
             return nil

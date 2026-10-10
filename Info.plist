@@ -5,7 +5,7 @@
     <key>CFBundleExecutable</key>
     <string>usage-touchbar</string>
     <key>CFBundleIdentifier</key>
-    <string>com.neelashkannan.usage-touchbar</string>
+    <string>local.usage-touchbar</string>
     <key>CFBundleName</key>
     <string>UsageTouchBar</string>
     <key>CFBundleDisplayName</key>
