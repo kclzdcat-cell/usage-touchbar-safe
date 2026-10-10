@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import Foundation
 import Security
 import SQLite3
@@ -738,6 +739,9 @@ struct AppConfig: Codable {
     var showMenuBar: Bool?
     var showInDock: Bool?
     var stripSlotPolicy: String?      // StripSlotPolicy.rawValue
+    var sodaLyrics: Bool?             // 汽水音乐在前台时显示歌词
+    var lyricsHighlightColor: String?
+    var lyricsBaseColor: String?
     var fontSize: String?             // FontSizeOption.rawValue
     var iconSize: String?             // IconSizeOption.rawValue
     var nameColor: String?            // "#RRGGBB"，服务名称
@@ -2186,6 +2190,21 @@ enum ControlStrip {
         }
     }
 
+    /// 展开一条 Touch Bar，但保留右侧的 Control Strip（系统按钮 + 我们的图标），
+    /// 效果和 QQ音乐 显示歌词一样。系统不支持这种方式时退回到铺满整条。
+    static func presentModalKeepingControlStrip(_ touchBar: NSTouchBar, trayIdentifier: NSTouchBarItem.Identifier) {
+        typealias PresentFn = @convention(c) (AnyObject, Selector, NSTouchBar, Int64, NSString) -> Void
+        for name in ["presentSystemModalTouchBar:placement:systemTrayItemIdentifier:",
+                     "presentSystemModalFunctionBar:placement:systemTrayItemIdentifier:"] {
+            let sel = NSSelectorFromString(name)
+            guard let method = class_getClassMethod(NSTouchBar.self, sel) else { continue }
+            let fn = unsafeBitCast(method_getImplementation(method), to: PresentFn.self)
+            fn(NSTouchBar.self, sel, touchBar, 1, trayIdentifier.rawValue as NSString)
+            return
+        }
+        presentModal(touchBar, trayIdentifier: trayIdentifier)
+    }
+
     /// Dismisses a previously presented system-modal Touch Bar.
     static func dismissModal(_ touchBar: NSTouchBar) {
         for name in ["dismissSystemModalTouchBar:", "dismissSystemModalFunctionBar:"] {
@@ -2246,6 +2265,14 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     /// 进入音乐 App 前是否处于展开状态，离开后用来恢复。
     private var restoreExpandedAfterMusic = false
     private var appActivationObserver: NSObjectProtocol?
+
+    // 汽水音乐歌词
+    static let lyricsIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.lyrics")
+    private let lyricsTouchBar = NSTouchBar()
+    private let lyricsView = KaraokeLineView(frame: NSRect(x: 0, y: 0, width: 600, height: 30))
+    private lazy var karaoke = KaraokeTimer(view: lyricsView)
+    private let lyricsReader = SodaLyricsReader()
+    private var sodaLyricsActive = false
     private let popover = NSPopover()
     private let loginWindow = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: 420, height: 320),
@@ -2316,10 +2343,53 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             let bundleID = app?.bundleIdentifier
             let name = app?.localizedName
-            MainActor.assumeIsolated { self?.frontmostAppChanged(to: bundleID, name: name) }
+            let pid = app?.processIdentifier
+            MainActor.assumeIsolated { self?.frontmostAppChanged(to: bundleID, name: name, pid: pid) }
         }
         let front = NSWorkspace.shared.frontmostApplication
-        frontmostAppChanged(to: front?.bundleIdentifier, name: front?.localizedName)
+        frontmostAppChanged(to: front?.bundleIdentifier, name: front?.localizedName, pid: front?.processIdentifier)
+    }
+
+    /// 进入 / 离开汽水音乐：显示 / 收起歌词栏。
+    private func updateSodaLyrics(active: Bool, pid: pid_t?) {
+        guard active != sodaLyricsActive else { return }
+        if active, let pid, ControlStrip.isSupported {
+            sodaLyricsActive = true
+            configureLyricsTouchBar()
+            lyricsReader.onLine = { [weak self] line in self?.karaoke.newLine(line) }
+            lyricsReader.start(pid: pid)
+            ControlStrip.presentModalKeepingControlStrip(lyricsTouchBar, trayIdentifier: Self.controlStripIdentifier)
+            fadeIn(lyricsView)
+        } else {
+            sodaLyricsActive = false
+            lyricsReader.stop()
+            karaoke.stop()
+            ControlStrip.dismissModal(lyricsTouchBar)
+        }
+    }
+
+    private func configureLyricsTouchBar() {
+        guard lyricsTouchBar.delegate == nil else { return }
+        lyricsTouchBar.delegate = self
+        lyricsTouchBar.defaultItemIdentifiers = [Self.lyricsIdentifier]
+        lyricsTouchBar.principalItemIdentifier = Self.lyricsIdentifier
+    }
+
+    /// 线性淡入，用于 Touch Bar 内容出现时。
+    private func fadeIn(_ view: NSView, duration: TimeInterval = 0.35) {
+        view.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = duration
+            context.timingFunction = CAMediaTimingFunction(name: .linear)
+            view.animator().alphaValue = 1
+        }
+    }
+
+    /// 用量栏重新展开时，所有用量内容线性淡入。
+    private func presentUsageBarAnimated() {
+        ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
+        for host in detailHosts.allObjects { fadeIn(host) }
+        for host in summaryHosts.allObjects { fadeIn(host) }
     }
 
     /// 是否正占着别的程序（比如输入法）的 Control Strip 位置。
@@ -2372,9 +2442,13 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     /// 前台 App 变了：进入音乐 App 时让出 Touch Bar，离开后恢复。
-    private func frontmostAppChanged(to bundleID: String?, name: String?) {
+    private func frontmostAppChanged(to bundleID: String?, name: String?, pid: pid_t? = nil) {
         let config = AppConfig.shared
-        let recognized = config.isMusicApp(bundleID: bundleID, name: name)
+        let isSoda = config.resolvedSodaLyrics && MusicApp.soda.matches(bundleID: bundleID, name: name)
+        // 汽水音乐显示歌词时也按音乐 App 处理（收起用量栏、AI 图标留在右侧）
+        let recognized = config.isMusicApp(bundleID: bundleID, name: name) || isSoda
+        // 汽水音乐歌词在音乐模式处理完之后再切换（defer 倒序执行，这一句最后执行）
+        defer { updateSodaLyrics(active: isSoda, pid: pid) }
         let isMusic = config.resolvedMusicMode != .off && recognized
         if bundleID != Bundle.main.bundleIdentifier {
             Diagnostics.recordFrontApp(name: name, bundleID: bundleID, recognizedAsMusic: recognized)
@@ -2402,7 +2476,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
                 ControlStrip.setVisible(controlStripItem, true)
             }
             if restoreExpandedAfterMusic, ControlStrip.isSupported {
-                ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
+                presentUsageBarAnimated()
             }
             restoreExpandedAfterMusic = false
         }
@@ -2425,8 +2499,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     private func keepPinnedTouchBarVisible() {
-        guard AppConfig.shared.resolvedPlacement == .pinned, !musicAppActive, !touchBar.isVisible else { return }
-        ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
+        guard AppConfig.shared.resolvedPlacement == .pinned, !musicAppActive, !sodaLyricsActive, !touchBar.isVisible else { return }
+        presentUsageBarAnimated()
     }
 
     /// 设置窗口里任何一项改动后调用：立即应用，无需重启。
@@ -2445,7 +2519,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             if placement == .controlStripOnly {
                 ControlStrip.dismissModal(touchBar)
             } else {
-                ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
+                presentUsageBarAnimated()
             }
         }
         appliedPlacement = placement
@@ -2455,7 +2529,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             musicAppActive = false
             if let controlStripItem { ControlStrip.setVisible(controlStripItem, true) }
         }
-        frontmostAppChanged(to: front?.bundleIdentifier, name: front?.localizedName)
+        frontmostAppChanged(to: front?.bundleIdentifier, name: front?.localizedName, pid: front?.processIdentifier)
     }
 
     /// 是否在 Dock 显示图标。显示时需要一个最简单的 App 菜单，否则屏幕顶部菜单栏是空的。
@@ -2520,6 +2594,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         pinTimer?.invalidate()
         pinTimer = nil
         stopStripReclaimLoop()
+        lyricsReader.stop()
+        karaoke.stop()
         if let appActivationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
         }
@@ -2531,6 +2607,13 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         switch identifier {
+        case Self.lyricsIdentifier:
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            lyricsView.translatesAutoresizingMaskIntoConstraints = false
+            lyricsView.widthAnchor.constraint(equalToConstant: 620).isActive = true
+            lyricsView.heightAnchor.constraint(equalToConstant: 30).isActive = true
+            item.view = lyricsView
+            return item
         case Self.summaryIdentifier:
             let item = NSCustomTouchBarItem(identifier: identifier)
             let host = TouchBarContentHost()
@@ -3134,8 +3217,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         holdingStripSlot = true
         if ownedProvider == nil, AppConfig.shared.resolvedPlacement != .controlStripOnly {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                guard let self, !self.musicAppActive else { return }
-                ControlStrip.presentModal(self.touchBar, trayIdentifier: Self.controlStripIdentifier)
+                guard let self, !self.musicAppActive, !self.sodaLyricsActive else { return }
+                self.presentUsageBarAnimated()
             }
         }
     }

@@ -44,7 +44,18 @@ jobs:
           swift --version
 
       - name: Build universal binary
-        run: swift build -c release --arch arm64 --arch x86_64
+        run: |
+          set -o pipefail
+          if ! swift build -c release --arch arm64 --arch x86_64 2>&1 | tee build.log; then
+            # 把编译错误变成 GitHub 注释，方便在网页和 API 里直接看到
+            grep -E '^/.+:[0-9]+:[0-9]+: error:' build.log | sort -u | head -40 | while IFS= read -r line; do
+              file=$(echo "$line" | cut -d: -f1 | sed "s#^$PWD/##")
+              ln=$(echo "$line" | cut -d: -f2)
+              msg=$(echo "$line" | cut -d: -f5- | sed 's/^ *//')
+              echo "::error file=$file,line=$ln::$msg"
+            done
+            exit 1
+          fi
 
       - name: Assemble, sign and package DMG
         run: |
