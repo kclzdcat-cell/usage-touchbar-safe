@@ -5,7 +5,7 @@
 <h1 align="center">Usage Touch Bar（加固版）</h1>
 
 <p align="center">
-  在 MacBook 的 Touch Bar 上实时显示 <b>Claude Code</b>、<b>Codex</b>、<b>Gemini</b>、<b>GLM / ZCode</b>、<b>OpenCode</b> 的用量额度。<br>
+  在 MacBook 的 Touch Bar 上实时显示 <b>Claude Code</b>、<b>Codex</b>、<b>Gemini</b>、<b>Antigravity</b>、<b>GLM / ZCode</b>、<b>Kimi</b>、<b>MiniMax</b>、<b>GitHub Copilot</b>、<b>Cursor</b> 等 AI 编程工具的用量额度。<br>
   基于 <a href="https://github.com/neelashkannan/usage-touchbar">neelashkannan/usage-touchbar</a> 二次开发：做了安全加固，加了中文图形设置、音乐 App 适配，并支持一键打包 DMG。
 </p>
 
@@ -36,8 +36,15 @@
   | Claude Code | Claude Code 的登录（钥匙串） | 5 小时 / 每周额度 |
   | Codex | `~/.codex/auth.json` | 5 小时 / 每周额度 |
   | Gemini | Gemini CLI 的 Google 登录 `~/.gemini/oauth_creds.json` | Pro / Flash 模型额度 |
+  | Antigravity | 本机正在运行的 Antigravity（只连 127.0.0.1，不联网） | Gemini / Claude 模型额度 |
   | GLM / ZCode | 智谱 API Key（设置里填写，或自动读取 Claude Code 里的 GLM 配置） | 5 小时 / 每周额度（ZCode 和 GLM Coding Plan 共用同一份额度） |
+  | Kimi | Kimi Code 的 API Key | 5 小时 / 每周额度 |
+  | MiniMax | 编程套餐的 API Key | 5 小时 / 每周额度 |
+  | GitHub Copilot | Copilot 编辑器插件保存的登录 `~/.config/github-copilot` | 高级请求 / 对话额度（每月） |
+  | Cursor | Cursor App 自己保存的登录（只读） | 套餐用量 / 超额用量（每个账单周期） |
   | OpenCode | 本地数据库 | 本地估算 |
+
+  暂不支持：通义千问 / 阿里云百炼（只能读浏览器 Cookie）、豆包（需要火山引擎 AK/SK 签名）、DeepSeek / Moonshot 开放平台（只有余额，没有额度百分比）。
 
 - **Control Strip 常驻图标**：可以是迷你柱状图，也可以是"图标 + 百分比"，点一下展开整条用量栏。
 - **中文图形设置窗口**：所有选项改完立即生效。窗口会跟着宽度自动排成三栏、两栏或一栏，并适配不同分辨率。
@@ -72,7 +79,8 @@
 
 | 分组 | 选项 |
 |---|---|
-| 显示哪些服务 | Claude / Codex / OpenCode 的显示与隐藏，以及从左到右的顺序 |
+| 服务 | 显示哪些服务（最多同时 3 个）和从左到右的顺序；每个服务的读取状态 |
+| 账号 | 各服务的登录来源；GLM、Kimi、MiniMax 的 API Key 和区域 |
 | Touch Bar | 显示位置（只显示 Control Strip 小图标 / 启动时自动展开 / 常驻展开）、展开后居中或靠左、Control Strip 样式、刷新和设置按钮 |
 | 显示内容 | 主要显示 5 小时额度还是每周额度、是否同时显示另一项、是否显示重置倒计时 |
 | 用量颜色 | 绿 / 橙 / 红或单色，以及变橙、变红的阈值 |
@@ -112,13 +120,19 @@ mdls -name kMDItemCFBundleIdentifier "/Applications/某某.app"
 | 本地日志里的 token 计数 | `~/.claude/projects/**/*.jsonl`、`~/.codex/sessions/`、OpenCode 数据库 | 离线时估算用量，只读取计数字段，不读对话内容 |
 | Gemini CLI 登录 | `~/.gemini/oauth_creds.json`（只读，从不改写） | 查询 Gemini 额度；令牌过期时在内存里续期 |
 | GLM API Key | 设置里填写的保存在 `~/.config/usage-touchbar/glm-key`（权限 600）；否则读 `~/.claude/settings.json` | 查询 GLM Coding Plan 额度 |
+| Kimi、MiniMax 的 API Key | 设置里填写，保存在 `~/.config/usage-touchbar/keys/`（权限 600） | 查询各自的编程套餐额度 |
+| Copilot 登录 | `~/.config/github-copilot/apps.json` / `hosts.json`（只读） | 查询 Copilot 额度 |
+| Cursor 登录 | Cursor App 的 `state.vscdb` 里的 `cursorAuth/accessToken`（只读） | 查询 Cursor 用量 |
+| Antigravity 本机服务 | 用系统接口读取 Antigravity 进程的启动参数和监听端口（不执行任何外部命令） | 向本机 127.0.0.1 查询额度 |
 | 前台 App 的名称和 Bundle ID | 系统通知 | 判断是不是音乐 App |
 
 **网络**：所有请求都必须经过 `Sources/UsageTouchBar/SafeNet.swift`，只用 HTTPS：
-- GET 只放行这几个用量接口的主机：`api.anthropic.com`（Claude）、`chatgpt.com`（Codex）、`open.bigmodel.cn` / `api.z.ai`（GLM）
+- GET 只放行这几个用量接口的主机：`api.anthropic.com`（Claude）、`chatgpt.com`（Codex）、`open.bigmodel.cn` / `api.z.ai`（GLM）、`api.kimi.com` / `api.kimi.ai`（Kimi）、`api.minimaxi.com` / `api.minimax.io`（MiniMax）、`api.github.com`（Copilot）、`cursor.com`（Cursor）
+- Antigravity 只允许 POST 到 `127.0.0.1` 上的一个固定路径；只有这一处接受本机的自签名证书，其他所有请求照常严格校验证书
 - POST 只放行三个具体地址：Gemini 的 `loadCodeAssist`、`retrieveUserQuota` 和 Google 登录续期 `oauth2.googleapis.com/token`
 - 跳转到白名单以外的地址会被拦截；不保存 Cookie 和缓存
-- Gemini、GLM 只有在你勾选显示时才会去连接
+- 除 Claude、Codex、OpenCode 外，其他服务只有在你勾选显示时才会去连接
+- 不读取任何浏览器 Cookie，不执行任何外部命令
 
 程序里没有统计上报，也不会调用任何 AI 对话接口。
 
@@ -201,7 +215,9 @@ usage-touchbar help              # 完整帮助
 |---|---|
 | [**Neelash Kannan**](https://github.com/neelashkannan) | 原项目 [usage-touchbar](https://github.com/neelashkannan/usage-touchbar) 的作者：用量读取、Touch Bar 和 Control Strip 显示、命令行工具 |
 | [**kclzdcat-cell**](https://github.com/kclzdcat-cell) | 本加固版的发起人和维护者：提出需求、在真机上测试、找出问题并验证修复 |
-| **Claude**（Anthropic） | 协助开发：安全审查和加固、中文设置窗口、自定义外观、音乐 App 适配、自适应布局、CI 打包 |
+| **Claude**（Anthropic） | 协助开发：安全审查和加固、中文设置窗口、自定义外观、音乐 App 适配、多家 AI 服务接入、CI 打包 |
+
+Gemini、Antigravity、Kimi、MiniMax、Copilot、Cursor 的接口和字段参考了开源项目 [CodexBar](https://github.com/steipete/CodexBar)（MIT 许可，© Peter Steinberger）；GLM 的接口参考了智谱官方的 [zai-coding-plugins](https://github.com/zai-org/zai-coding-plugins)。
 
 感谢原作者开源这个项目。
 
