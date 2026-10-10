@@ -1087,7 +1087,7 @@ struct ClaudeUsageCollector: UsageCollecting {
         // 刚失败过就先别重试：失败后每次刷新都去请求，会一直被限流
         let backoff: TimeInterval
         if let status = Self.lastStatus(), !status.ok {
-            backoff = status.short == "被限流" ? Self.liveCacheLock.withLock { rateLimitPenalty } : 30
+            backoff = status.short == "被限流" ? Self.liveCacheLock.withLock { Self.rateLimitPenalty } : 30
         } else {
             backoff = 0
         }
@@ -1155,8 +1155,8 @@ struct ClaudeUsageCollector: UsageCollecting {
             return nil
         case 429:
             let wait = Self.liveCacheLock.withLock { () -> TimeInterval in
-                rateLimitPenalty = min(300, max(60, rateLimitPenalty * 2))
-                return rateLimitPenalty
+                Self.rateLimitPenalty = min(300, max(60, Self.rateLimitPenalty * 2))
+                return Self.rateLimitPenalty
             }
             Self.record(ok: false, short: "被限流",
                         detail: "请求太频繁，被 Anthropic 暂时限流（HTTP 429），先放慢到约 \(Int(wait)) 秒查一次，恢复后会自动加快。")
@@ -1173,7 +1173,7 @@ struct ClaudeUsageCollector: UsageCollecting {
             return nil
         }
         Self.record(ok: true, short: "正常", detail: "实时读取正常（\(Self.timeText(Date()))）。")
-        Self.liveCacheLock.withLock { rateLimitPenalty = rateLimitPenalty < 40 ? 0 : rateLimitPenalty / 2 }
+        Self.liveCacheLock.withLock { Self.rateLimitPenalty = Self.rateLimitPenalty < 40 ? 0 : Self.rateLimitPenalty / 2 }
 
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
