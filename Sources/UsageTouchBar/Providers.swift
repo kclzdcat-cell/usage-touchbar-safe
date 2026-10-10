@@ -189,7 +189,11 @@ struct GLMUsageCollector: UsageCollecting {
     }
 
     private func fetch(_ credentials: GLMCredentials.Credentials) async -> UsageSnapshot? {
-        guard let url = URL(string: "https://\(credentials.host)/api/monitor/usage/quota/limit") else { return nil }
+        // 地址写死成常量（不拼接），安全自查才能确认只会连这两个地址
+        let address = credentials.host == GLMCredentials.intlHost
+            ? "https://api.z.ai/api/monitor/usage/quota/limit"
+            : "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
+        guard let url = URL(string: address) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
         // 智谱的这个接口不用 "Bearer " 前缀
