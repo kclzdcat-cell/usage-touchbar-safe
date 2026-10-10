@@ -109,17 +109,34 @@ enum MusicMode: String, CaseIterable {
     }
 }
 
-/// 内置支持的音乐 App。
+/// 内置支持的音乐 App。除了精确的 Bundle ID，也按关键词和显示名称识别，
+/// 这样 App 改了 ID 或装的是别的版本也能认出来。
 struct MusicApp {
     let name: String
     let bundleID: String
+    let idKeywords: [String]
+    let names: [String]
 
     static let builtIn: [MusicApp] = [
-        MusicApp(name: "QQ音乐", bundleID: "com.tencent.QQMusicMac"),
-        MusicApp(name: "网易云音乐", bundleID: "com.netease.163music"),
-        MusicApp(name: "Apple 音乐", bundleID: "com.apple.Music"),
-        MusicApp(name: "Spotify", bundleID: "com.spotify.client"),
+        MusicApp(name: "QQ音乐", bundleID: "com.tencent.QQMusicMac",
+                 idKeywords: ["qqmusic"], names: ["QQ音乐", "QQMusic"]),
+        MusicApp(name: "网易云音乐", bundleID: "com.netease.163music",
+                 idKeywords: ["163music", "neteasemusic", "netease.music"], names: ["网易云音乐", "NeteaseMusic", "NetEase Cloud Music"]),
+        MusicApp(name: "Apple 音乐", bundleID: "com.apple.Music",
+                 idKeywords: [], names: ["音乐", "Music"]),
+        MusicApp(name: "Spotify", bundleID: "com.spotify.client",
+                 idKeywords: ["spotify"], names: ["Spotify"]),
     ]
+
+    func matches(bundleID: String?, name: String?) -> Bool {
+        if let bundleID {
+            if bundleID.caseInsensitiveCompare(self.bundleID) == .orderedSame { return true }
+            let lower = bundleID.lowercased()
+            if idKeywords.contains(where: { lower.contains($0) }) { return true }
+        }
+        if let name, names.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) { return true }
+        return false
+    }
 }
 
 // MARK: - 读取配置（带默认值）
@@ -158,6 +175,18 @@ extension AppConfig {
     }
     var resolvedMusicApps: Set<String> {
         Set(resolvedBuiltInMusicApps + resolvedCustomMusicApps)
+    }
+
+    /// 这个 App 是否算“音乐 App”（勾选的内置 App 按 ID/关键词/名称识别，自定义的按 ID）。
+    func isMusicApp(bundleID: String?, name: String?) -> Bool {
+        let enabled = Set(resolvedBuiltInMusicApps)
+        for app in MusicApp.builtIn where enabled.contains(app.bundleID) {
+            if app.matches(bundleID: bundleID, name: name) { return true }
+        }
+        if let bundleID {
+            return resolvedCustomMusicApps.contains { $0.caseInsensitiveCompare(bundleID) == .orderedSame }
+        }
+        return false
     }
     var resolvedCenterContent: Bool { centerContent ?? true }
     var resolvedShowResetCountdown: Bool { showResetCountdown ?? true }
@@ -242,6 +271,34 @@ extension UsageSnapshot {
         case .fiveHour: Metric(percent: weeklyPercent, resetAt: weeklyResetAt, shortLabel: "W")
         case .weekly: Metric(percent: dailyPercent, resetAt: dailyResetAt, shortLabel: "5h")
         }
+    }
+}
+
+// MARK: - 诊断信息（显示在设置窗口底部）
+
+@MainActor
+enum Diagnostics {
+    static let changed = Notification.Name("UsageTouchBarDiagnosticsChanged")
+
+    private(set) static var lastAppName: String?
+    private(set) static var lastAppBundleID: String?
+    private(set) static var lastAppIsMusic = false
+    private(set) static var controlStripSupported = false
+    private(set) static var controlStripInstalled = false
+    private(set) static var musicModeActive = false
+
+    static func recordFrontApp(name: String?, bundleID: String?, recognizedAsMusic: Bool) {
+        lastAppName = name
+        lastAppBundleID = bundleID
+        lastAppIsMusic = recognizedAsMusic
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static func update(controlStripSupported: Bool, controlStripInstalled: Bool, musicModeActive: Bool) {
+        self.controlStripSupported = controlStripSupported
+        self.controlStripInstalled = controlStripInstalled
+        self.musicModeActive = musicModeActive
+        NotificationCenter.default.post(name: changed, object: nil)
     }
 }
 
@@ -374,7 +431,10 @@ final class DisplaySettingsViewController: NSViewController {
     private let loginSwitch = NSSwitch()
     private let providerStack = NSStackView()
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
+    private let diagnosticsLabel = NSTextField(wrappingLabelWithString: "")
+    private let addFrontAppButton = NSButton(title: "把它加入音乐 App 列表", target: nil, action: nil)
     private let content = NSStackView()
+    private var diagnosticsObserver: NSObjectProtocol?
 
     private var arrangement: [(provider: Provider, enabled: Bool)] = []
     private var isReloading = false
@@ -453,6 +513,8 @@ final class DisplaySettingsViewController: NSViewController {
             .item("对这些 App 生效：", musicApps),
             .item("其他 App：", customMusicField),
             .full(musicTip),
+            .full(diagnosticsLabel),
+            .full(addFrontAppButton),
             .section("其他"),
             .item("刷新间隔：", intervalPopup),
             .item("菜单栏显示用量文字：", menuBarSwitch),
@@ -479,6 +541,18 @@ final class DisplaySettingsViewController: NSViewController {
         content.spacing = 16
         content.addArrangedSubview(columns)
         content.addArrangedSubview(statusLabel)
+
+        diagnosticsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        diagnosticsLabel.preferredMaxLayoutWidth = 300
+        addFrontAppButton.target = self
+        addFrontAppButton.action = #selector(addFrontApp(_:))
+        addFrontAppButton.bezelStyle = .rounded
+        addFrontAppButton.controlSize = .small
+        diagnosticsObserver = NotificationCenter.default.addObserver(
+            forName: Diagnostics.changed, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateDiagnostics() }
+        }
         content.translatesAutoresizingMaskIntoConstraints = false
 
         // 放进滚动区域：窗口可以随意拉大缩小，缩小时可以滚动查看。
@@ -640,6 +714,32 @@ final class DisplaySettingsViewController: NSViewController {
         updateMusicControlsEnabled()
         arrangement = config.arrangement
         renderProviders()
+        updateDiagnostics()
+    }
+
+    private func updateDiagnostics() {
+        let name = Diagnostics.lastAppName ?? "（还没有切换过 App）"
+        let id = Diagnostics.lastAppBundleID ?? "—"
+        let recognized = Diagnostics.lastAppBundleID == nil ? "" : (Diagnostics.lastAppIsMusic ? "✓ 已识别为音乐 App" : "✗ 不在音乐 App 列表里")
+        let strip = Diagnostics.controlStripSupported
+            ? (Diagnostics.controlStripInstalled ? "已添加" : "未添加")
+            : "系统不支持"
+        diagnosticsLabel.stringValue = """
+        诊断：上一个前台 App
+          \(name)
+          \(id)  \(recognized)
+        Control Strip 图标：\(strip)
+        """
+        addFrontAppButton.isHidden = Diagnostics.lastAppBundleID == nil || Diagnostics.lastAppIsMusic
+    }
+
+    @objc private func addFrontApp(_ sender: Any?) {
+        guard let id = Diagnostics.lastAppBundleID else { return }
+        var list = AppConfig.shared.resolvedCustomMusicApps
+        if !list.contains(id) { list.append(id) }
+        customMusicField.stringValue = list.joined(separator: ", ")
+        valueChanged(nil)
+        statusLabel.stringValue = "已把 \(Diagnostics.lastAppName ?? id) 加入音乐 App 列表。"
     }
 
     private func updateMusicControlsEnabled() {

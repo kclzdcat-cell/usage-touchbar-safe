@@ -2302,17 +2302,26 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             object: nil,
             queue: .main
         ) { [weak self] note in
-            let bundleID = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
-            MainActor.assumeIsolated { self?.frontmostAppChanged(to: bundleID) }
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            let bundleID = app?.bundleIdentifier
+            let name = app?.localizedName
+            MainActor.assumeIsolated { self?.frontmostAppChanged(to: bundleID, name: name) }
         }
-        frontmostAppChanged(to: NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+        let front = NSWorkspace.shared.frontmostApplication
+        frontmostAppChanged(to: front?.bundleIdentifier, name: front?.localizedName)
     }
 
     /// 前台 App 变了：进入音乐 App 时让出 Touch Bar，离开后恢复。
-    private func frontmostAppChanged(to bundleID: String?) {
+    private func frontmostAppChanged(to bundleID: String?, name: String?) {
         let config = AppConfig.shared
-        let isMusic = config.resolvedMusicMode != .off
-            && bundleID.map { config.resolvedMusicApps.contains($0) } == true
+        let recognized = config.isMusicApp(bundleID: bundleID, name: name)
+        let isMusic = config.resolvedMusicMode != .off && recognized
+        if bundleID != Bundle.main.bundleIdentifier {
+            Diagnostics.recordFrontApp(name: name, bundleID: bundleID, recognizedAsMusic: recognized)
+        }
+        Diagnostics.update(controlStripSupported: ControlStrip.isSupported,
+                           controlStripInstalled: controlStripItem != nil,
+                           musicModeActive: isMusic)
         guard isMusic != musicAppActive else { return }
         musicAppActive = isMusic
 
@@ -2376,12 +2385,12 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         }
         appliedPlacement = placement
         // 音乐 App 设置可能变了，按当前前台 App 重新判断一次
-        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let front = NSWorkspace.shared.frontmostApplication
         if musicAppActive {
             musicAppActive = false
             if let controlStripItem { ControlStrip.setVisible(controlStripItem, true) }
         }
-        frontmostAppChanged(to: front)
+        frontmostAppChanged(to: front?.bundleIdentifier, name: front?.localizedName)
     }
 
     /// 是否在 Dock 显示图标。显示时需要一个最简单的 App 菜单，否则屏幕顶部菜单栏是空的。
