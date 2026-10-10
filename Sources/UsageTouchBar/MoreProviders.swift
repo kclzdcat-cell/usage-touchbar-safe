@@ -173,7 +173,7 @@ enum AntigravityLocal {
 
 struct AntigravityUsageCollector: UsageCollecting {
     let provider: Provider = .antigravity
-    static let cache = LiveCache(freshFor: 60)
+    static let cache = LiveCache(freshFor: 10)   // 只连本机，可以查得勤一些
 
     private struct Response: Decodable {
         let userStatus: UserStatus?
@@ -297,7 +297,7 @@ enum CopilotCredentials {
 
 struct CopilotUsageCollector: UsageCollecting {
     let provider: Provider = .copilot
-    static let cache = LiveCache(freshFor: 5 * 60)
+    static let cache = LiveCache(freshFor: 60)   // 按月计的额度，最快每分钟查一次
 
     func collect() async -> UsageSnapshot {
         let token = CopilotCredentials.token()
@@ -407,7 +407,7 @@ enum CursorCredentials {
 
 struct CursorUsageCollector: UsageCollecting {
     let provider: Provider = .cursor
-    static let cache = LiveCache(freshFor: 5 * 60)
+    static let cache = LiveCache(freshFor: 60)   // 按账单周期计，最快每分钟查一次
 
     func collect() async -> UsageSnapshot {
         let cookie = CursorCredentials.cookie()
@@ -469,7 +469,7 @@ struct CursorUsageCollector: UsageCollecting {
 
 struct KimiUsageCollector: UsageCollecting {
     let provider: Provider = .kimi
-    static let cache = LiveCache(freshFor: 2 * 60)
+    static let cache = LiveCache(freshFor: 20)
 
     func collect() async -> UsageSnapshot {
         let key = APIKeyStore.key(for: .kimi)
@@ -535,7 +535,7 @@ struct KimiUsageCollector: UsageCollecting {
 
 struct MiniMaxUsageCollector: UsageCollecting {
     let provider: Provider = .minimax
-    static let cache = LiveCache(freshFor: 2 * 60)
+    static let cache = LiveCache(freshFor: 20)
 
     func collect() async -> UsageSnapshot {
         let key = APIKeyStore.key(for: .minimax)

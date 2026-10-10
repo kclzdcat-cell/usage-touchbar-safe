@@ -120,6 +120,14 @@ enum Provider: String, CaseIterable, Sendable {
     }
 }
 
+/// 实时数据多久查一次：跟用户设置的刷新间隔走（留 3 秒余量，避免恰好差一点没过期而白等一轮），
+/// 但不低于每个服务自己的下限。
+enum LiveInterval {
+    static func fresh(floor: TimeInterval) -> TimeInterval {
+        max(floor, AppConfig.shared.resolvedRefreshInterval) - 3
+    }
+}
+
 enum UsageFormat {
     /// Color graded by how much of a limit is consumed.
     static func color(forPercent percent: Double) -> NSColor {
@@ -503,7 +511,12 @@ struct CodexUsageCollector: UsageCollecting {
     private static let liveCacheLock = NSLock()
     private nonisolated(unsafe) static var liveCache: UsageSnapshot?
     private nonisolated(unsafe) static var liveCacheAt: Date?
-    private static let liveMinInterval: TimeInterval = 30
+    private static var liveMinInterval: TimeInterval { LiveInterval.fresh(floor: 15) }
+
+    /// 刷新按钮：下一次读取不用缓存。
+    static func expireCache() {
+        liveCacheLock.withLock { liveCacheAt = nil }
+    }
 
     private static func freshLiveSnapshot() -> UsageSnapshot? {
         liveCacheLock.lock()
@@ -987,7 +1000,17 @@ struct ClaudeUsageCollector: UsageCollecting {
     private static let liveCacheLock = NSLock()
     private nonisolated(unsafe) static var liveCache: UsageSnapshot?
     private nonisolated(unsafe) static var liveCacheAt: Date?
-    private static let liveMinInterval: TimeInterval = 5 * 60
+    /// 原来写死 5 分钟才查一次，导致用量更新很慢。现在按刷新间隔查；
+    /// 被限流（HTTP 429）时额外等待的时间逐级翻倍（最长 5 分钟），成功后逐步恢复。
+    private nonisolated(unsafe) static var rateLimitPenalty: TimeInterval = 0
+    private static var liveMinInterval: TimeInterval {
+        LiveInterval.fresh(floor: 20) + rateLimitPenalty
+    }
+
+    /// 刷新按钮：下一次读取不用缓存，立刻真正查一次（被限流时除外）。
+    static func expireCache() {
+        liveCacheLock.withLock { liveCacheAt = nil }
+    }
 
     /// 最近一次实时读取的结果，给设置窗口的诊断栏和 Touch Bar 显示失败原因用。
     struct LiveStatus: Sendable {
@@ -1064,7 +1087,7 @@ struct ClaudeUsageCollector: UsageCollecting {
         // 刚失败过就先别重试：失败后每次刷新都去请求，会一直被限流
         let backoff: TimeInterval
         if let status = Self.lastStatus(), !status.ok {
-            backoff = status.short == "被限流" ? 5 * 60 : 60
+            backoff = status.short == "被限流" ? Self.liveCacheLock.withLock { rateLimitPenalty } : 30
         } else {
             backoff = 0
         }
@@ -1131,8 +1154,12 @@ struct ClaudeUsageCollector: UsageCollecting {
                         detail: "Anthropic 拒绝了这个登录（HTTP \(http.statusCode)）。在终端运行一次 claude 刷新登录后会自动恢复。")
             return nil
         case 429:
+            let wait = Self.liveCacheLock.withLock { () -> TimeInterval in
+                rateLimitPenalty = min(300, max(60, rateLimitPenalty * 2))
+                return rateLimitPenalty
+            }
             Self.record(ok: false, short: "被限流",
-                        detail: "请求太频繁，被暂时限流（HTTP 429）。程序每 5 分钟才请求一次，稍后会自动恢复。")
+                        detail: "请求太频繁，被 Anthropic 暂时限流（HTTP 429），先放慢到约 \(Int(wait)) 秒查一次，恢复后会自动加快。")
             return nil
         default:
             Self.record(ok: false, short: "HTTP \(http.statusCode)",
@@ -1146,6 +1173,7 @@ struct ClaudeUsageCollector: UsageCollecting {
             return nil
         }
         Self.record(ok: true, short: "正常", detail: "实时读取正常（\(Self.timeText(Date()))）。")
+        Self.liveCacheLock.withLock { rateLimitPenalty = rateLimitPenalty < 40 ? 0 : rateLimitPenalty / 2 }
 
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -3311,6 +3339,13 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     @objc private func refreshButtonPressed() {
         ClaudeUsageCollector.clearFailure()
+        ClaudeUsageCollector.expireCache()
+        CodexUsageCollector.expireCache()
+        for cache in [GeminiUsageCollector.cache, AntigravityUsageCollector.cache, GLMUsageCollector.cache,
+                      KimiUsageCollector.cache, MiniMaxUsageCollector.cache, CopilotUsageCollector.cache,
+                      CursorUsageCollector.cache] {
+            cache.expire()
+        }
         refresh()
     }
 

@@ -15,16 +15,27 @@ final class LiveCache: @unchecked Sendable {
     private var snapshot: UsageSnapshot?
     private var snapshotAt: Date?
     private var status: Status?
-    private let freshFor: TimeInterval
+    /// 最快多久查一次（比如按月计的额度没必要每 20 秒查）。实际间隔跟着设置里的刷新间隔走。
+    private let floor: TimeInterval
+    /// 被限流后额外等待的时间：逐级翻倍，最长 5 分钟；成功后逐步恢复。
+    private var penalty: TimeInterval = 0
 
-    init(freshFor: TimeInterval) {
-        self.freshFor = freshFor
+    init(freshFor floor: TimeInterval) {
+        self.floor = floor
     }
 
     func fresh() -> UsageSnapshot? {
         lock.lock(); defer { lock.unlock() }
-        guard let snapshot, let snapshotAt, Date().timeIntervalSince(snapshotAt) < freshFor else { return nil }
+        let interval = LiveInterval.fresh(floor: floor) + penalty
+        guard let snapshot, let snapshotAt, Date().timeIntervalSince(snapshotAt) < interval else { return nil }
         return snapshot
+    }
+
+    /// 刷新按钮：下一次读取不用缓存（被限流时仍然会等）。
+    func expire() {
+        lock.lock(); defer { lock.unlock() }
+        snapshotAt = nil
+        if status?.ok == false, status?.short != "被限流" { status = nil }
     }
 
     func last() -> UsageSnapshot? {
@@ -36,11 +47,14 @@ final class LiveCache: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         snapshot = value
         snapshotAt = Date()
-        status = Status(ok: true, short: "正常", detail: "实时读取正常。", at: Date())
+        penalty = penalty < 40 ? 0 : penalty / 2
+        let time = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        status = Status(ok: true, short: "正常", detail: "实时读取正常（\(time)）。", at: Date())
     }
 
     func fail(_ short: String, _ detail: String) {
         lock.lock(); defer { lock.unlock() }
+        if short == "被限流" { penalty = min(300, max(60, penalty * 2)) }
         status = Status(ok: false, short: short, detail: detail, at: Date())
     }
 
@@ -53,7 +67,7 @@ final class LiveCache: @unchecked Sendable {
     var inBackoff: Bool {
         lock.lock(); defer { lock.unlock() }
         guard let status, !status.ok else { return false }
-        let wait: TimeInterval = status.short == "被限流" ? 300 : 60
+        let wait: TimeInterval = status.short == "被限流" ? max(60, penalty) : 30
         return Date().timeIntervalSince(status.at) < wait
     }
 
@@ -157,7 +171,7 @@ enum GLMCredentials {
 
 struct GLMUsageCollector: UsageCollecting {
     let provider: Provider = .glm
-    static let cache = LiveCache(freshFor: 2 * 60)
+    static let cache = LiveCache(freshFor: 20)
 
     private struct Response: Decodable {
         let code: Int?
@@ -386,7 +400,7 @@ enum GeminiCredentials {
 
 struct GeminiUsageCollector: UsageCollecting {
     let provider: Provider = .gemini
-    static let cache = LiveCache(freshFor: 3 * 60)
+    static let cache = LiveCache(freshFor: 30)
     private static let base = "https://cloudcode-pa.googleapis.com/v1internal"
 
     private static let projectLock = NSLock()
