@@ -193,6 +193,7 @@ extension AppConfig {
     var resolvedShowSecondaryMetric: Bool { showSecondaryMetric ?? true }
     var resolvedShowMenuBar: Bool { showMenuBar ?? true }
     var resolvedShowInDock: Bool { showInDock ?? true }
+    var resolvedReclaimControlStrip: Bool { reclaimControlStrip ?? true }
     /// 菜单栏和 Touch Bar 按钮不能同时隐藏，否则就没有入口打开设置了。
     var resolvedShowTouchBarButtons: Bool { (showTouchBarButtons ?? true) || !resolvedShowMenuBar }
     var resolvedWarnThreshold: Double { warnThreshold ?? 60 }
@@ -428,6 +429,7 @@ final class DisplaySettingsViewController: NSViewController {
     private let buttonsSwitch = NSSwitch()
     private let menuBarSwitch = NSSwitch()
     private let dockSwitch = NSSwitch()
+    private let reclaimSwitch = NSSwitch()
     private let loginSwitch = NSSwitch()
     private let providerStack = NSStackView()
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
@@ -474,6 +476,7 @@ final class DisplaySettingsViewController: NSViewController {
             .item("显示位置：", placementPopup),
             .item("展开后内容：", alignPopup),
             .item("Control Strip 样式：", stripStylePopup),
+            .item("抢占 Control Strip 位置：", reclaimSwitch),
             .item("刷新 / 设置按钮：", buttonsSwitch),
             .section("显示内容"),
             .item("主要显示：", metricPopup),
@@ -621,7 +624,7 @@ final class DisplaySettingsViewController: NSViewController {
             gridRow.rowAlignment = .none
             if sectionRows.contains(index) && index > 0 { gridRow.topPadding = 10 }
         }
-        for control in [resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, loginSwitch,
+        for control in [resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, loginSwitch, reclaimSwitch,
                         nameColorWell, percentColorWell, detailColorWell] as [NSView] {
             if let cell = grid.cell(for: control) {
                 cell.yPlacement = .center
@@ -668,7 +671,7 @@ final class DisplaySettingsViewController: NSViewController {
                         warnPopup, dangerPopup, intervalPopup, musicModePopup,
                         fontSizeControl, iconSizeControl,
                         nameColorWell, percentColorWell, detailColorWell, customMusicField,
-                        resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch] as [NSControl] {
+                        resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, reclaimSwitch] as [NSControl] {
             control.target = self
             control.action = #selector(valueChanged(_:))
         }
@@ -710,6 +713,7 @@ final class DisplaySettingsViewController: NSViewController {
         buttonsSwitch.state = (config.showTouchBarButtons ?? true) ? .on : .off
         menuBarSwitch.state = config.resolvedShowMenuBar ? .on : .off
         dockSwitch.state = config.resolvedShowInDock ? .on : .off
+        reclaimSwitch.state = config.resolvedReclaimControlStrip ? .on : .off
         loginSwitch.state = LaunchAtLogin.isEnabled ? .on : .off
         updateMusicControlsEnabled()
         arrangement = config.arrangement
@@ -864,6 +868,7 @@ final class DisplaySettingsViewController: NSViewController {
         config.showTouchBarButtons = buttonsSwitch.state == .on
         config.showMenuBar = menuBarSwitch.state == .on
         config.showInDock = dockSwitch.state == .on
+        config.reclaimControlStrip = reclaimSwitch.state == .on
         updateMusicControlsEnabled()
 
         var notes: [String] = []

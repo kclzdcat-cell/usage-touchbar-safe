@@ -737,6 +737,7 @@ struct AppConfig: Codable {
     var refreshInterval: Double?
     var showMenuBar: Bool?
     var showInDock: Bool?
+    var reclaimControlStrip: Bool?
     var fontSize: String?             // FontSizeOption.rawValue
     var iconSize: String?             // IconSizeOption.rawValue
     var nameColor: String?            // "#RRGGBB"，服务名称
@@ -2147,6 +2148,16 @@ enum ControlStrip {
         _ = (NSTouchBarItem.self as AnyObject).perform(sel, with: item)
     }
 
+    /// 重新申请 Control Strip 的位置。macOS 只给第三方程序留一个位置，
+    /// 谁最后申请就显示谁；别的程序（比如输入法）占了位置时，用这个抢回来。
+    static func reclaim(_ item: NSTouchBarItem) {
+        let sel = NSSelectorFromString("addSystemTrayItem:")
+        if (NSTouchBarItem.self as AnyObject).responds(to: sel) {
+            _ = (NSTouchBarItem.self as AnyObject).perform(sel, with: item)
+        }
+        setPresent(item.identifier, true)
+    }
+
     /// 暂时隐藏 / 恢复 Control Strip 图标（不删除，避免删了加不回来）。
     static func setVisible(_ item: NSTouchBarItem, _ visible: Bool) {
         setPresent(item.identifier, visible)
@@ -2311,6 +2322,13 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         frontmostAppChanged(to: front?.bundleIdentifier, name: front?.localizedName)
     }
 
+    /// 每次切换 App、每次刷新都重新申请 Control Strip 位置（“隐藏”模式下在音乐 App 里除外）。
+    private func reclaimControlStripIfWanted() {
+        guard let controlStripItem, ControlStrip.isSupported,
+              AppConfig.shared.resolvedReclaimControlStrip, !hiddenForMusic else { return }
+        ControlStrip.reclaim(controlStripItem)
+    }
+
     /// 前台 App 变了：进入音乐 App 时让出 Touch Bar，离开后恢复。
     private func frontmostAppChanged(to bundleID: String?, name: String?) {
         let config = AppConfig.shared
@@ -2322,6 +2340,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         Diagnostics.update(controlStripSupported: ControlStrip.isSupported,
                            controlStripInstalled: controlStripItem != nil,
                            musicModeActive: isMusic)
+        defer { reclaimControlStripIfWanted() }
         guard isMusic != musicAppActive else { return }
         musicAppActive = isMusic
 
@@ -2897,6 +2916,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func refreshTouchBar() {
         refreshAuthState()
+        reclaimControlStripIfWanted()
         reloadTouchBarContent()
         if let controlStripButton {
             if ownedProvider == nil {
