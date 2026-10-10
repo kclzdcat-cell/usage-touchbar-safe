@@ -140,11 +140,6 @@ struct MusicApp {
                  idKeywords: ["spotify"], names: ["Spotify"]),
     ]
 
-    /// 汽水音乐：单独处理（它自己不在 Touch Bar 显示歌词，由我们来显示）。
-    static let soda = MusicApp(name: "汽水音乐", bundleID: "com.soda.music",
-                               idKeywords: ["sodamusic", "soda.music", "soda-music", "bytedance.luna"],
-                               names: ["汽水音乐", "Soda Music", "SodaMusic"])
-
     /// 这些 App 永远不会被当成音乐 App（防止误加入后用量栏不显示）。
     static let neverMusic = ["com.anthropic.", "com.openai.", "local.usage-touchbar"]
 
@@ -216,7 +211,6 @@ extension AppConfig {
     var resolvedShowSecondaryMetric: Bool { showSecondaryMetric ?? true }
     var resolvedShowMenuBar: Bool { showMenuBar ?? true }
     var resolvedShowInDock: Bool { showInDock ?? true }
-    var resolvedSodaLyrics: Bool { sodaLyrics ?? true }
     var resolvedStripSlotPolicy: StripSlotPolicy {
         stripSlotPolicy.flatMap(StripSlotPolicy.init(rawValue:)) ?? .musicOnly
     }
@@ -411,7 +405,7 @@ final class SettingsWindowController: NSWindowController {
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 520, height: 360)
         window.setContentSize(settingsVC.idealSize)
-        window.setFrameAutosaveName("UsageTouchBarSettings")
+        window.setFrameAutosaveName("UsageTouchBarSettings.v3")
         super.init(window: window)
     }
 
@@ -465,12 +459,6 @@ final class DisplaySettingsViewController: NSViewController {
     private let menuBarSwitch = NSSwitch()
     private let dockSwitch = NSSwitch()
     private let slotPopup = NSPopUpButton()
-    private let sodaSwitch = NSSwitch()
-    private let lyricsHighlightWell = NSColorWell()
-    private let lyricsBaseWell = NSColorWell()
-    private let axStatusLabel = NSTextField(labelWithString: "")
-    private let axButton = NSButton(title: "授权", target: nil, action: nil)
-    private let sodaProbeButton = NSButton(title: "读取测试", target: nil, action: nil)
     private let loginSwitch = NSSwitch()
     private let providerStack = NSStackView()
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
@@ -503,30 +491,13 @@ final class DisplaySettingsViewController: NSViewController {
     var idealSize: NSSize {
         _ = view
         let fitting = content.fittingSize
-        let maxHeight = (NSScreen.main?.visibleFrame.height ?? 800) - 60
-        return NSSize(width: fitting.width + 48, height: min(fitting.height + 40, maxHeight))
+        let screen = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1400, height: 800)
+        return NSSize(width: min(fitting.width + 48, screen.width - 40),
+                      height: min(fitting.height + 40, screen.height - 60))
     }
 
     override func loadView() {
         configureControls()
-
-        let left = makeGrid([
-            .section("显示哪些服务（勾选显示，↑ ↓ 调整从左到右的顺序）"),
-            .full(providerStack),
-            .section("Touch Bar"),
-            .item("显示位置：", placementPopup),
-            .item("展开后内容：", alignPopup),
-            .item("Control Strip 样式：", stripStylePopup),
-            .item("刷新 / 设置按钮：", buttonsSwitch),
-            .section("显示内容"),
-            .item("主要显示：", metricPopup),
-            .item("同时显示另一项额度：", secondarySwitch),
-            .item("显示重置倒计时：", resetSwitch),
-            .section("用量颜色"),
-            .item("配色：", colorPopup),
-            .item("超过多少变橙色：", warnPopup),
-            .item("超过多少变红色：", dangerPopup),
-        ])
 
         let resetColors = NSButton(title: "恢复默认样式", target: self, action: #selector(resetStyle(_:)))
         resetColors.bezelStyle = .rounded
@@ -541,9 +512,26 @@ final class DisplaySettingsViewController: NSViewController {
             "其他 App 可以填 Bundle ID，用逗号分隔。查询方法：终端运行 mdls -name kMDItemCFBundleIdentifier \"/Applications/某某.app\"")
         musicTip.font = .systemFont(ofSize: 11)
         musicTip.textColor = .secondaryLabelColor
-        musicTip.preferredMaxLayoutWidth = 300
+        musicTip.preferredMaxLayoutWidth = 320
 
-        let right = makeGrid([
+        let column1 = makeGrid([
+            .section("显示哪些服务（勾选显示，↑ ↓ 调整顺序）"),
+            .full(providerStack),
+            .section("Touch Bar"),
+            .item("显示位置：", placementPopup),
+            .item("展开后内容：", alignPopup),
+            .item("Control Strip 样式：", stripStylePopup),
+            .item("刷新 / 设置按钮：", buttonsSwitch),
+            .section("显示内容"),
+            .item("主要显示：", metricPopup),
+            .item("同时显示另一项额度：", secondarySwitch),
+            .item("显示重置倒计时：", resetSwitch),
+        ])
+        let column2 = makeGrid([
+            .section("用量颜色"),
+            .item("配色：", colorPopup),
+            .item("超过多少变橙色：", warnPopup),
+            .item("超过多少变红色：", dangerPopup),
             .section("文字与图标"),
             .item("字号：", fontSizeControl),
             .item("图标大小：", iconSizeControl),
@@ -551,36 +539,60 @@ final class DisplaySettingsViewController: NSViewController {
             .item("百分比数字颜色：", percentColorWell),
             .item("套餐、倒计时颜色：", detailColorWell),
             .item("", resetColors),
-            .section("音乐 App（歌词）"),
-            .item("音乐 App 在前台时：", musicModePopup),
-            .item("Control Strip 图标位置：", slotPopup),
-            .item("对这些 App 生效：", musicApps),
-            .item("其他 App：", customMusicField),
-            .full(musicTip),
-            .full(diagnosticsLabel),
-            .full(addFrontAppButton),
-            .section("汽水音乐歌词"),
-            .item("在 Touch Bar 显示歌词：", sodaSwitch),
-            .item("已唱部分颜色：", lyricsHighlightWell),
-            .item("未唱部分颜色：", lyricsBaseWell),
-            .item("辅助功能权限：", axRow()),
-            .item("", sodaProbeButton),
             .section("其他"),
             .item("刷新间隔：", intervalPopup),
             .item("菜单栏显示用量文字：", menuBarSwitch),
             .item("在 Dock 显示图标：", dockSwitch),
             .item("登录时自动启动：", loginSwitch),
         ])
+        let column3 = makeGrid([
+            .section("音乐 App（歌词）"),
+            .item("音乐 App 在前台时：", musicModePopup),
+            .item("Control Strip 图标：", slotPopup),
+            .item("对这些 App 生效：", musicApps),
+            .item("其他 App：", customMusicField),
+            .full(musicTip),
+            .full(diagnosticsLabel),
+            .full(addFrontAppButton),
+        ])
 
-        let divider = NSBox()
-        divider.boxType = .separator
-
-        let columns = NSStackView(views: [left, divider, right])
-        columns.orientation = .horizontal
-        columns.alignment = .top
-        columns.spacing = 28
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        divider.heightAnchor.constraint(equalTo: columns.heightAnchor).isActive = true
+        // 三栏都贴着顶部排，栏之间用分隔线
+        let columns = NSView()
+        let grids = [column1, column2, column3]
+        var constraints: [NSLayoutConstraint] = []
+        var previous: NSView?
+        for (index, grid) in grids.enumerated() {
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            columns.addSubview(grid)
+            constraints += [
+                grid.topAnchor.constraint(equalTo: columns.topAnchor),
+                grid.bottomAnchor.constraint(lessThanOrEqualTo: columns.bottomAnchor),
+            ]
+            if let previous {
+                let divider = NSBox()
+                divider.boxType = .separator
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                columns.addSubview(divider)
+                constraints += [
+                    divider.leadingAnchor.constraint(equalTo: previous.trailingAnchor, constant: 24),
+                    divider.topAnchor.constraint(equalTo: columns.topAnchor),
+                    divider.bottomAnchor.constraint(equalTo: columns.bottomAnchor),
+                    divider.widthAnchor.constraint(equalToConstant: 1),
+                    grid.leadingAnchor.constraint(equalTo: divider.trailingAnchor, constant: 24),
+                ]
+            } else {
+                constraints.append(grid.leadingAnchor.constraint(equalTo: columns.leadingAnchor))
+            }
+            if index == grids.count - 1 {
+                constraints.append(grid.trailingAnchor.constraint(equalTo: columns.trailingAnchor))
+            }
+            previous = grid
+        }
+        // 栏的高度取最高的那一栏
+        let tallest = columns.heightAnchor.constraint(equalToConstant: 0)
+        tallest.priority = .defaultLow
+        constraints.append(tallest)
+        NSLayoutConstraint.activate(constraints)
 
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
@@ -635,13 +647,6 @@ final class DisplaySettingsViewController: NSViewController {
         reload()
     }
 
-    private func axRow() -> NSView {
-        let row = NSStackView(views: [axStatusLabel, axButton])
-        row.orientation = .horizontal
-        row.spacing = 8
-        return row
-    }
-
     private func makeGrid(_ rows: [Row]) -> NSGridView {
         func label(_ text: String) -> NSTextField {
             let field = NSTextField(labelWithString: text)
@@ -679,8 +684,7 @@ final class DisplaySettingsViewController: NSViewController {
             if sectionRows.contains(index) && index > 0 { gridRow.topPadding = 10 }
         }
         for control in [resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, loginSwitch,
-                        nameColorWell, percentColorWell, detailColorWell,
-                        sodaSwitch, lyricsHighlightWell, lyricsBaseWell] as [NSView] {
+                        nameColorWell, percentColorWell, detailColorWell] as [NSView] {
             if let cell = grid.cell(for: control) {
                 cell.yPlacement = .center
                 cell.row?.rowAlignment = .none
@@ -717,16 +721,7 @@ final class DisplaySettingsViewController: NSViewController {
         customMusicField.translatesAutoresizingMaskIntoConstraints = false
         customMusicField.widthAnchor.constraint(equalToConstant: 220).isActive = true
 
-        axButton.target = self
-        axButton.action = #selector(requestAccessibility(_:))
-        axButton.bezelStyle = .rounded
-        axButton.controlSize = .small
-        sodaProbeButton.target = self
-        sodaProbeButton.action = #selector(probeSoda(_:))
-        sodaProbeButton.bezelStyle = .rounded
-        sodaProbeButton.controlSize = .small
-
-        for well in [nameColorWell, percentColorWell, detailColorWell, lyricsHighlightWell, lyricsBaseWell] {
+        for well in [nameColorWell, percentColorWell, detailColorWell] {
             well.translatesAutoresizingMaskIntoConstraints = false
             well.widthAnchor.constraint(equalToConstant: 44).isActive = true
             well.heightAnchor.constraint(equalToConstant: 24).isActive = true
@@ -736,7 +731,6 @@ final class DisplaySettingsViewController: NSViewController {
                         warnPopup, dangerPopup, intervalPopup, musicModePopup,
                         fontSizeControl, iconSizeControl,
                         nameColorWell, percentColorWell, detailColorWell, customMusicField,
-                        sodaSwitch, lyricsHighlightWell, lyricsBaseWell,
                         resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, dockSwitch, slotPopup] as [NSControl] {
             control.target = self
             control.action = #selector(valueChanged(_:))
@@ -779,10 +773,6 @@ final class DisplaySettingsViewController: NSViewController {
         buttonsSwitch.state = (config.showTouchBarButtons ?? true) ? .on : .off
         menuBarSwitch.state = config.resolvedShowMenuBar ? .on : .off
         dockSwitch.state = config.resolvedShowInDock ? .on : .off
-        sodaSwitch.state = config.resolvedSodaLyrics ? .on : .off
-        lyricsHighlightWell.color = LyricsStyle.highlightColor
-        lyricsBaseWell.color = NSColor(hexString: config.lyricsBaseColor) ?? NSColor(white: 1, alpha: 1).blended(withFraction: 0.45, of: .black) ?? .gray
-        updateAccessibilityStatus()
         slotPopup.selectItem(at: StripSlotPolicy.allCases.firstIndex(of: config.resolvedStripSlotPolicy) ?? 0)
         loginSwitch.state = LaunchAtLogin.isEnabled ? .on : .off
         updateMusicControlsEnabled()
@@ -806,7 +796,6 @@ final class DisplaySettingsViewController: NSViewController {
         """
         addFrontAppButton.isHidden = Diagnostics.lastAppBundleID == nil || Diagnostics.lastAppIsMusic
         addFrontAppButton.title = "把「\(Diagnostics.lastAppName ?? "它")」加入音乐 App 列表…"
-        updateAccessibilityStatus()
     }
 
     @objc private func addFrontApp(_ sender: Any?) {
@@ -947,10 +936,6 @@ final class DisplaySettingsViewController: NSViewController {
         config.showTouchBarButtons = buttonsSwitch.state == .on
         config.showMenuBar = menuBarSwitch.state == .on
         config.showInDock = dockSwitch.state == .on
-        config.sodaLyrics = sodaSwitch.state == .on
-        config.lyricsHighlightColor = Self.hexIfChanged(lyricsHighlightWell.color, default: LyricsStyle.defaultHighlight)
-        let baseDefault = NSColor(white: 1, alpha: 1).blended(withFraction: 0.45, of: .black) ?? .gray
-        config.lyricsBaseColor = Self.hexIfChanged(lyricsBaseWell.color, default: baseDefault)
         config.stripSlotPolicy = StripSlotPolicy.allCases[max(0, slotPopup.indexOfSelectedItem)].rawValue
         updateMusicControlsEnabled()
 
@@ -976,48 +961,6 @@ final class DisplaySettingsViewController: NSViewController {
     private static func hexIfChanged(_ color: NSColor, default defaultColor: NSColor) -> String? {
         let hex = color.hexString
         return hex == defaultColor.hexString ? nil : hex
-    }
-
-    private func updateAccessibilityStatus() {
-        let trusted = SodaAX.isTrusted
-        axStatusLabel.stringValue = trusted ? "✓ 已授权" : "未授权（读取汽水音乐歌词需要）"
-        axButton.isHidden = trusted
-    }
-
-    @objc private func requestAccessibility(_ sender: Any?) {
-        SodaAX.requestPermission()
-        SodaAX.openPrivacySettings()
-        statusLabel.stringValue = "在「隐私与安全性 › 辅助功能」里打开 Usage Touch Bar 的开关。每次安装新版本后可能需要重新打开一次。"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.updateAccessibilityStatus() }
-    }
-
-    @objc private func probeSoda(_ sender: Any?) {
-        let soda = NSWorkspace.shared.runningApplications.first {
-            MusicApp.soda.matches(bundleID: $0.bundleIdentifier, name: $0.localizedName)
-        }
-        var report = SodaAX.probeReport(pid: soda?.processIdentifier)
-        if let soda {
-            report = "汽水音乐 Bundle ID：\(soda.bundleIdentifier ?? "—")\n\n" + report
-        }
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 520, height: 320))
-        textView.string = report
-        textView.isEditable = false
-        textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        let scroll = NSScrollView(frame: textView.frame)
-        scroll.hasVerticalScroller = true
-        scroll.documentView = textView
-
-        let alert = NSAlert()
-        alert.messageText = "汽水音乐读取测试"
-        alert.informativeText = "把下面的内容复制发给 Claude，可以帮助改进歌词读取。"
-        alert.accessoryView = scroll
-        alert.addButton(withTitle: "复制")
-        alert.addButton(withTitle: "关闭")
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(report, forType: .string)
-            statusLabel.stringValue = "已复制读取结果。"
-        }
     }
 
     @objc private func loginChanged(_ sender: NSSwitch) {
