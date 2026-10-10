@@ -5,7 +5,7 @@
 <h1 align="center">Usage Touch Bar（加固版）</h1>
 
 <p align="center">
-  在 MacBook 的 Touch Bar 上实时显示 <b>Claude Code</b>、<b>Codex</b>、<b>OpenCode</b> 的用量额度。<br>
+  在 MacBook 的 Touch Bar 上实时显示 <b>Claude Code</b>、<b>Codex</b>、<b>Gemini</b>、<b>GLM / ZCode</b>、<b>OpenCode</b> 的用量额度。<br>
   基于 <a href="https://github.com/neelashkannan/usage-touchbar">neelashkannan/usage-touchbar</a> 二次开发：做了安全加固，加了中文图形设置、音乐 App 适配，并支持一键打包 DMG。
 </p>
 
@@ -28,7 +28,17 @@
 
 ## 功能
 
-- **Touch Bar 实时用量**：显示每个服务的 5 小时额度和每周额度、重置倒计时、套餐（PRO / MAX），按用量用绿、橙、红变色。
+- **Touch Bar 实时用量**：显示每个服务的 5 小时额度和每周额度、重置倒计时、套餐（PRO / MAX），按用量用绿、橙、红变色。最多同时显示 3 个服务。
+- **支持的服务**：
+
+  | 服务 | 数据来源 | 显示内容 |
+  |---|---|---|
+  | Claude Code | Claude Code 的登录（钥匙串） | 5 小时 / 每周额度 |
+  | Codex | `~/.codex/auth.json` | 5 小时 / 每周额度 |
+  | Gemini | Gemini CLI 的 Google 登录 `~/.gemini/oauth_creds.json` | Pro / Flash 模型额度 |
+  | GLM / ZCode | 智谱 API Key（设置里填写，或自动读取 Claude Code 里的 GLM 配置） | 5 小时 / 每周额度（ZCode 和 GLM Coding Plan 共用同一份额度） |
+  | OpenCode | 本地数据库 | 本地估算 |
+
 - **Control Strip 常驻图标**：可以是迷你柱状图，也可以是"图标 + 百分比"，点一下展开整条用量栏。
 - **中文图形设置窗口**：所有选项改完立即生效。窗口会跟着宽度自动排成三栏、两栏或一栏，并适配不同分辨率。
 - **外观可自定义**：字号、图标大小，以及服务名称、百分比数字、套餐和倒计时这三类文字的颜色。
@@ -100,12 +110,20 @@ mdls -name kMDItemCFBundleIdentifier "/Applications/某某.app"
 | Claude 登录 token | `~/.claude/.credentials.json`，没有则读钥匙串 `Claude Code-credentials` | 查询 Claude 用量 |
 | Codex 登录 token | `~/.codex/auth.json` | 查询 Codex 用量 |
 | 本地日志里的 token 计数 | `~/.claude/projects/**/*.jsonl`、`~/.codex/sessions/`、OpenCode 数据库 | 离线时估算用量，只读取计数字段，不读对话内容 |
+| Gemini CLI 登录 | `~/.gemini/oauth_creds.json`（只读，从不改写） | 查询 Gemini 额度；令牌过期时在内存里续期 |
+| GLM API Key | 设置里填写的保存在 `~/.config/usage-touchbar/glm-key`（权限 600）；否则读 `~/.claude/settings.json` | 查询 GLM Coding Plan 额度 |
 | 前台 App 的名称和 Bundle ID | 系统通知 | 判断是不是音乐 App |
 
-**网络**：所有请求都必须经过 `Sources/UsageTouchBar/SafeNet.swift`。它只放行发往 `api.anthropic.com`、`chatgpt.com` 的 HTTPS GET 请求，跳转到白名单以外的地址会被拦截，也不保存 Cookie 和缓存。程序里没有统计上报，也不会调用 AI 对话接口。
+**网络**：所有请求都必须经过 `Sources/UsageTouchBar/SafeNet.swift`，只用 HTTPS：
+- GET 只放行这几个用量接口的主机：`api.anthropic.com`（Claude）、`chatgpt.com`（Codex）、`open.bigmodel.cn` / `api.z.ai`（GLM）
+- POST 只放行三个具体地址：Gemini 的 `loadCodeAssist`、`retrieveUserQuota` 和 Google 登录续期 `oauth2.googleapis.com/token`
+- 跳转到白名单以外的地址会被拦截；不保存 Cookie 和缓存
+- Gemini、GLM 只有在你勾选显示时才会去连接
+
+程序里没有统计上报，也不会调用任何 AI 对话接口。
 
 **CI 安全自查**（每次编译前自动执行，不通过就不编译）：
-- 源码里出现的网址只能指向 `api.anthropic.com`、`chatgpt.com`、`claude.ai`、`opencode.ai`（后两个只是登录页面链接）
+- 源码里出现的网址只能指向上面这些用量接口，以及 `claude.ai`、`opencode.ai`、`gemini.google.com`、`bigmodel.cn` 这几个登录页面链接；接口地址必须写成常量，不能拼接
 - 禁止绕过 `SafeNet` 直接发网络请求
 - 禁止执行外部命令（`Process`、`osascript`、`/bin/sh` 等）
 
