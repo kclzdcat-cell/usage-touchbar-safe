@@ -86,10 +86,16 @@ enum Provider: String, CaseIterable, Sendable {
 enum UsageFormat {
     /// Color graded by how much of a limit is consumed.
     static func color(forPercent percent: Double) -> NSColor {
-        switch percent {
-        case ..<60: NSColor.systemGreen
-        case ..<85: NSColor.systemOrange
-        default: NSColor.systemRed
+        let config = AppConfig.shared
+        let warn = config.resolvedWarnThreshold
+        let danger = config.resolvedDangerThreshold
+        switch config.resolvedColorScheme {
+        case .traffic:
+            if percent < warn { return NSColor.systemGreen }
+            if percent < danger { return NSColor.systemOrange }
+            return NSColor.systemRed
+        case .mono:
+            return percent < danger ? NSColor.labelColor : NSColor.systemRed
         }
     }
 
@@ -716,6 +722,20 @@ struct AppConfig: Codable {
     var claudeWeeklyTokenBudget: Int?
     var claudePlanLabel: String?
     var providers: [ProviderSetting]?
+
+    // 自定义显示设置（全部可选，缺省时沿用原版行为）。见 Settings.swift。
+    var placement: String?            // TouchBarPlacement.rawValue
+    var centerContent: Bool?
+    var controlStripStyle: String?    // ControlStripStyle.rawValue
+    var primaryMetric: String?        // PrimaryMetric.rawValue
+    var showResetCountdown: Bool?
+    var showSecondaryMetric: Bool?
+    var showTouchBarButtons: Bool?
+    var colorScheme: String?          // UsageColorScheme.rawValue
+    var warnThreshold: Double?
+    var dangerThreshold: Double?
+    var refreshInterval: Double?
+    var showMenuBar: Bool?
 
     /// Mutable so the Arrange window can apply changes without a relaunch.
     nonisolated(unsafe) static var shared = load()
@@ -1594,11 +1614,11 @@ final class ArrangeViewController: NSViewController {
             $0.removeFromSuperview()
         }
 
-        let title = NSTextField(labelWithString: "Arrange Touch Bar")
+        let title = NSTextField(labelWithString: "显示哪些、按什么顺序")
         title.font = .systemFont(ofSize: 18, weight: .bold)
         stack.addArrangedSubview(title)
 
-        let note = NSTextField(wrappingLabelWithString: "Check to show a provider; use ↑ ↓ to set the left-to-right order. Click Apply.")
+        let note = NSTextField(wrappingLabelWithString: "勾选要显示的服务；用 ↑ ↓ 调整从左到右的顺序，然后点「应用」。")
         note.font = .systemFont(ofSize: 12)
         note.textColor = .secondaryLabelColor
         note.preferredMaxLayoutWidth = 324
@@ -1609,7 +1629,7 @@ final class ArrangeViewController: NSViewController {
             stack.addArrangedSubview(row(index: index, item: item))
         }
 
-        let apply = NSButton(title: "Apply", target: self, action: #selector(applyTapped))
+        let apply = NSButton(title: "应用", target: self, action: #selector(applyTapped))
         apply.bezelStyle = .rounded
         apply.keyEquivalent = "\r"
         if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(16, after: last) }
@@ -1988,10 +2008,11 @@ final class StackedUsageBarView: NSView {
     }
 
     init(primaryPercent: Double?, primaryTrailing: String, primaryReset: String?,
-         secondaryPercent: Double?, secondaryTrailing: String) {
-        self.primary = UsageBar(caption: "5h", percent: primaryPercent,
+         secondaryPercent: Double?, secondaryTrailing: String,
+         primaryCaption: String = "5h", secondaryCaption: String = "Wk") {
+        self.primary = UsageBar(caption: primaryCaption, percent: primaryPercent,
                                 trailing: primaryTrailing, reset: primaryReset)
-        self.secondary = UsageBar(caption: "Wk", percent: secondaryPercent,
+        self.secondary = UsageBar(caption: secondaryCaption, percent: secondaryPercent,
                                   trailing: secondaryTrailing, reset: nil)
         super.init(frame: .zero)
         wantsLayer = true
@@ -2212,23 +2233,12 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         defer: false
     )
     private lazy var hostPanel = TouchBarHostPanel(touchBarController: self)
-    private var arrangeVC: ArrangeViewController?
-    private lazy var arrangeWindow: NSWindow = {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 280),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Usage Touch Bar"
-        window.isReleasedWhenClosed = false
-        let vc = ArrangeViewController { [weak self] items in
-            self?.applyArrangement(items)
-        }
-        arrangeVC = vc
-        window.contentViewController = vc
-        return window
-    }()
+    private lazy var settingsWindow = SettingsWindowController(
+        onChange: { [weak self] in self?.applySettings() },
+        onArrange: { [weak self] items in self?.applyArrangement(items) }
+    )
+    private var pinTimer: Timer?
+    private var controlStripWidth: NSLayoutConstraint?
     private weak var summaryItem: NSCustomTouchBarItem?
     private weak var detailItem: NSCustomTouchBarItem?
     private weak var codexButton: NSButton?
@@ -2271,9 +2281,49 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         updateCodexSessionWatcher()
         updateOpenCodeDBWatcher()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+        restartTimers()
+    }
+
+    /// 按配置的刷新间隔重建定时器；“常驻展开”模式额外每 3 秒检查一次是否被收起。
+    private func restartTimers() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: AppConfig.shared.resolvedRefreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        pinTimer?.invalidate()
+        pinTimer = nil
+        if AppConfig.shared.resolvedPlacement == .pinned, ControlStrip.isSupported {
+            pinTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.keepPinnedTouchBarVisible() }
+            }
+        }
+    }
+
+    private func keepPinnedTouchBarVisible() {
+        guard AppConfig.shared.resolvedPlacement == .pinned, !touchBar.isVisible else { return }
+        ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
+    }
+
+    /// 设置窗口里任何一项改动后调用：立即应用，无需重启。
+    private func applySettings() {
+        AppConfig.reload()
+        statusItem?.isVisible = AppConfig.shared.resolvedShowMenuBar
+        configureTouchBar()
+        teardownControlStripItem()
+        installControlStripItem()
+        refreshTouchBar()
+        restartTimers()
+    }
+
+    /// 打开设置窗口（菜单栏、Touch Bar 齿轮、再次双击 App 都会走这里）。
+    func showSettingsWindow() {
+        settingsWindow.present()
+    }
+
+    private var defaultTouchBarItems: [NSTouchBarItem.Identifier] {
+        AppConfig.shared.resolvedShowTouchBarButtons
+            ? [Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
+            : [Self.detailIdentifier]
     }
 
     func makeTouchBar() -> NSTouchBar {
@@ -2284,6 +2334,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     func stop() {
         timer?.invalidate()
         timer = nil
+        pinTimer?.invalidate()
+        pinTimer = nil
         teardownCodexSessionWatcher()
         teardownOpenCodeDBWatcher()
         teardownControlStripItem()
@@ -2336,11 +2388,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     /// Opens the Arrange window (show/hide + reorder providers).
     @objc private func showSettings() {
-        let window = arrangeWindow   // triggers lazy init + sets arrangeVC
-        arrangeVC?.refresh()
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        showSettingsWindow()
     }
 
     /// Persists a new arrangement and applies it live (no relaunch needed).
@@ -2354,11 +2402,11 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         teardownControlStripItem()
         installControlStripItem()
         refreshTouchBar()
-        arrangeVC?.refresh()
     }
 
     private func configureStatusItem() {
         guard let statusItem else { return }
+        statusItem.isVisible = AppConfig.shared.resolvedShowMenuBar
         if let button = statusItem.button {
             button.attributedTitle = statusAttributedTitle()
             button.imagePosition = .noImage
@@ -2385,7 +2433,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
                 .foregroundColor: NSColor.secondaryLabelColor
             ]))
             let snapshot = snapshots[provider]
-            if let snapshot, snapshot.error == nil, let percent = snapshot.dailyPercent {
+            if let snapshot, snapshot.error == nil, let percent = snapshot.primaryMetric.percent {
                 result.append(NSAttributedString(string: "\(Int(percent.rounded()))%", attributes: [
                     .font: valueFont,
                     .foregroundColor: UsageFormat.color(forPercent: percent)
@@ -2410,7 +2458,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
         let menu = NSMenu()
 
-        let title = NSMenuItem(title: "Usage", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "AI 用量", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
         menu.addItem(.separator())
@@ -2421,7 +2469,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             if let snapshot, snapshot.error == nil {
                 let five = UsageFormat.percentText(snapshot.dailyPercent)
                 let week = UsageFormat.percentText(snapshot.weeklyPercent)
-                detail = "  5h \(five)  ·  Wk \(week)"
+                detail = "  5小时 \(five)  ·  本周 \(week)"
             } else if let snapshot, let error = snapshot.error {
                 detail = "  \(error)"
             } else {
@@ -2435,24 +2483,24 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
         menu.addItem(.separator())
 
-        let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refreshButtonPressed), keyEquivalent: "r")
+        let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(refreshButtonPressed), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
 
-        let arrangeItem = NSMenuItem(title: "Arrange…", action: #selector(showSettings), keyEquivalent: "a")
+        let arrangeItem = NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ",")
         arrangeItem.target = self
         menu.addItem(arrangeItem)
 
-        let loginItem = NSMenuItem(title: "Connect Accounts…", action: #selector(showLoginWindow), keyEquivalent: "l")
+        let loginItem = NSMenuItem(title: "连接账号…", action: #selector(showLoginWindow), keyEquivalent: "l")
         loginItem.target = self
         menu.addItem(loginItem)
 
-        let focusItem = NSMenuItem(title: "Focus Touch Bar", action: #selector(focusTouchBarHost), keyEquivalent: "t")
+        let focusItem = NSMenuItem(title: "展开 Touch Bar", action: #selector(focusTouchBarHost), keyEquivalent: "t")
         focusItem.target = self
         menu.addItem(focusItem)
 
         menu.addItem(.separator())
-        let quitItem = NSMenuItem(title: "Quit Usage Touch Bar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "退出 Usage Touch Bar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quitItem.target = NSApp
         menu.addItem(quitItem)
 
@@ -2461,10 +2509,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func configureTouchBar() {
         touchBar.delegate = self
-        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
+        touchBar.defaultItemIdentifiers = defaultTouchBarItems
         touchBar.customizationAllowedItemIdentifiers = [Self.summaryIdentifier, Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
         touchBar.customizationIdentifier = NSTouchBar.CustomizationIdentifier("UsageTouchBar.default")
-        touchBar.principalItemIdentifier = Self.detailIdentifier
+        touchBar.principalItemIdentifier = AppConfig.shared.resolvedCenterContent ? Self.detailIdentifier : nil
     }
 
     private func configurePopover() {
@@ -2549,14 +2597,29 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             row.addArrangedSubview(title)
 
             if let snapshot, snapshot.error == nil {
-                let dailyReset = UsageFormat.resetText(snapshot.dailyResetAt)
-                row.addArrangedSubview(stackedBar(
-                    primaryPercent: snapshot.dailyPercent,
-                    primaryTrailing: UsageFormat.percentText(snapshot.dailyPercent),
-                    primaryReset: dailyReset == "—" ? nil : dailyReset,
-                    secondaryPercent: snapshot.weeklyPercent,
-                    secondaryTrailing: UsageFormat.percentText(snapshot.weeklyPercent)
-                ))
+                let config = AppConfig.shared
+                let primary = snapshot.primaryMetric
+                let secondary = snapshot.secondaryMetric
+                let resetText = UsageFormat.resetText(primary.resetAt)
+                let reset = (config.resolvedShowResetCountdown && resetText != "—") ? resetText : nil
+                if config.resolvedShowSecondaryMetric {
+                    row.addArrangedSubview(stackedBar(
+                        primaryPercent: primary.percent,
+                        primaryTrailing: UsageFormat.percentText(primary.percent),
+                        primaryReset: reset,
+                        secondaryPercent: secondary.percent,
+                        secondaryTrailing: UsageFormat.percentText(secondary.percent),
+                        primaryCaption: primary.shortLabel,
+                        secondaryCaption: secondary.shortLabel
+                    ))
+                } else {
+                    row.addArrangedSubview(bar(
+                        caption: primary.shortLabel,
+                        percent: primary.percent,
+                        trailing: UsageFormat.percentText(primary.percent),
+                        reset: reset
+                    ))
+                }
             } else {
                 row.addArrangedSubview(label(snapshot?.error ?? "—", color: .systemOrange, bold: false, size: 10))
             }
@@ -2654,6 +2717,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         primaryReset: String?,
         secondaryPercent: Double?,
         secondaryTrailing: String,
+        primaryCaption: String = "5h",
+        secondaryCaption: String = "Wk",
         width: CGFloat = 130
     ) -> StackedUsageBarView {
         let view = StackedUsageBarView(
@@ -2661,7 +2726,9 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             primaryTrailing: primaryTrailing,
             primaryReset: primaryReset,
             secondaryPercent: secondaryPercent,
-            secondaryTrailing: secondaryTrailing
+            secondaryTrailing: secondaryTrailing,
+            primaryCaption: primaryCaption,
+            secondaryCaption: secondaryCaption
         )
         view.translatesAutoresizingMaskIntoConstraints = false
         view.widthAnchor.constraint(equalToConstant: width).isActive = true
@@ -2683,10 +2750,12 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         summaryItem?.view = makeSummaryView()
         detailItem?.view = makeDetailView()
         if let controlStripButton {
-            controlStripButton.image = makeControlStripTriggerImage()
+            let image = controlStripImage(for: controlStripButton.providers)
+            controlStripButton.image = image
+            controlStripWidth?.constant = controlStripButtonWidth(for: controlStripButton.providers, image: image)
             controlStripButton.needsDisplay = true
         }
-        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
+        touchBar.defaultItemIdentifiers = defaultTouchBarItems
         statusItem?.button?.attributedTitle = statusAttributedTitle()
         rebuildStatusMenu()
         (popover.contentViewController as? UsageViewController)?.reload()
@@ -2815,7 +2884,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         claudeButton?.image = makeLogoImage(provider: .claude, selected: selectedProvider == .claude)
         summaryItem?.view = makeSummaryView()
         detailItem?.view = makeDetailView()
-        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
+        touchBar.defaultItemIdentifiers = defaultTouchBarItems
     }
 
     private func installControlStripItem() {
@@ -2844,7 +2913,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         controlStripItem = item
         controlStripButton = button
         ControlStrip.add(item)
-        if ownedProvider == nil {
+        if ownedProvider == nil, AppConfig.shared.resolvedPlacement != .controlStripOnly {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 guard let self else { return }
                 ControlStrip.presentModal(self.touchBar, trayIdentifier: Self.controlStripIdentifier)
@@ -2864,13 +2933,28 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         button.isBordered = false
         button.imagePosition = .imageOnly
         button.imageScaling = .scaleProportionallyDown
-        button.image = providers.count > 1 ? makeControlStripTriggerImage() : makeControlStripImage(for: providers)
+        let image = controlStripImage(for: providers)
+        button.image = image
         button.toolTip = providers.map(\.rawValue).joined(separator: " / ")
         button.providers = providers
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: providers.count > 1 ? 32 : 59).isActive = true
+        let width = button.widthAnchor.constraint(equalToConstant: controlStripButtonWidth(for: providers, image: image))
+        width.isActive = true
+        controlStripWidth = width
         button.heightAnchor.constraint(equalToConstant: 30).isActive = true
         return button
+    }
+
+    /// Control Strip 上的图：迷你柱状图（多个服务时）或 图标+数字。
+    private func controlStripImage(for providers: [Provider]) -> NSImage {
+        let useNumbers = providers.count <= 1 || AppConfig.shared.resolvedControlStripStyle == .numbers
+        return useNumbers ? makeControlStripImage(for: providers) : makeControlStripTriggerImage()
+    }
+
+    private func controlStripButtonWidth(for providers: [Provider], image: NSImage) -> CGFloat {
+        let useNumbers = providers.count <= 1 || AppConfig.shared.resolvedControlStripStyle == .numbers
+        guard useNumbers else { return 32 }
+        return min(180, max(59, ceil(image.size.width) + 6))
     }
 
     /// Bundle identifiers / fallback app paths for the providers' desktop apps,
@@ -2884,7 +2968,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         let snapshot = store.currentSnapshots().first { $0.provider == provider }
         let text: String
         let color: NSColor
-        if let snapshot, snapshot.error == nil, let percent = snapshot.dailyPercent {
+        if let snapshot, snapshot.error == nil, let percent = snapshot.primaryMetric.percent {
             text = "\(min(99, Int(percent.rounded())))"
             color = UsageFormat.color(forPercent: percent)
         } else {
@@ -2958,7 +3042,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             track.fill()
 
             let snapshot = snapshots[provider]
-            guard let snapshot, snapshot.error == nil, let percent = snapshot.dailyPercent else { continue }
+            guard let snapshot, snapshot.error == nil, let percent = snapshot.primaryMetric.percent else { continue }
             let clamped = max(0, min(100, percent))
             let fillHeight = max(barWidth, trackHeight * CGFloat(clamped / 100))
             let fill = NSBezierPath(
@@ -3015,8 +3099,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             .font: NSFont.systemFont(ofSize: 11, weight: .semibold)
         ]
         let hasUsage = snapshot != nil && snapshot?.error == nil
-        let dailyPercent = hasUsage ? snapshot?.dailyPercent : nil
-        let weeklyPercent = hasUsage ? snapshot?.weeklyPercent : nil
+        let primaryMetric = snapshot?.primaryMetric
+        let secondaryMetric = snapshot?.secondaryMetric
+        let dailyPercent = hasUsage ? primaryMetric?.percent : nil
+        let weeklyPercent = hasUsage ? secondaryMetric?.percent : nil
         let usageColor: NSColor = hasUsage
             ? UsageFormat.color(forPercent: dailyPercent ?? 0)
             : .systemGray
@@ -3058,8 +3144,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         // enough room — a short slot still shows the percent, which is the
         // number the user actually watches.
         var rightEdge = width - 2
-        if hasUsage,
-           let dailyReset = snapshot?.dailyResetAt {
+        if hasUsage, AppConfig.shared.resolvedShowResetCountdown,
+           let dailyReset = primaryMetric?.resetAt {
             let resetText = UsageFormat.resetText(dailyReset)
             if resetText != "—" && resetText != "now" {
                 let text = "↻ \(resetText)" as NSString
@@ -3075,9 +3161,14 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         usage.draw(at: NSPoint(x: rightEdge - usageSize.width, y: 10), withAttributes: usageAttrs)
 
         // Bottom line: a visible 5-hour usage bar + weekly percentage on the right.
-        let weeklyText = "W \(UsageFormat.percentText(weeklyPercent))" as NSString
-        let weeklySize = weeklyText.size(withAttributes: weekAttrs)
-        weeklyText.draw(at: NSPoint(x: width - weeklySize.width - 2, y: 1.5), withAttributes: weekAttrs)
+        let showSecondary = AppConfig.shared.resolvedShowSecondaryMetric
+        let weeklyText = (showSecondary
+            ? "\(secondaryMetric?.shortLabel ?? "W") \(UsageFormat.percentText(weeklyPercent))"
+            : "") as NSString
+        let weeklySize = showSecondary ? weeklyText.size(withAttributes: weekAttrs) : .zero
+        if showSecondary {
+            weeklyText.draw(at: NSPoint(x: width - weeklySize.width - 2, y: 1.5), withAttributes: weekAttrs)
+        }
 
         let barX = textX
         let barMaxX = width - weeklySize.width - 8
@@ -3501,6 +3592,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    /// 已经在运行时再次双击 App，打开设置窗口（菜单栏隐藏时的入口）。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        MainActor.assumeIsolated { controller?.showSettingsWindow() }
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {

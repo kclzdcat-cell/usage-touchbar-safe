@@ -1,0 +1,359 @@
+import AppKit
+import ServiceManagement
+
+// MARK: - 选项定义
+
+enum TouchBarPlacement: String, CaseIterable {
+    case controlStripOnly
+    case expandOnLaunch
+    case pinned
+
+    var title: String {
+        switch self {
+        case .controlStripOnly: "只在右侧 Control Strip 显示小图标"
+        case .expandOnLaunch: "启动时自动展开整条 Touch Bar"
+        case .pinned: "常驻展开整条 Touch Bar"
+        }
+    }
+}
+
+enum ControlStripStyle: String, CaseIterable {
+    case gauge
+    case numbers
+
+    var title: String {
+        switch self {
+        case .gauge: "迷你柱状图"
+        case .numbers: "图标 + 百分比数字"
+        }
+    }
+}
+
+enum PrimaryMetric: String, CaseIterable {
+    case fiveHour
+    case weekly
+
+    var title: String {
+        switch self {
+        case .fiveHour: "5 小时额度"
+        case .weekly: "每周额度"
+        }
+    }
+}
+
+enum UsageColorScheme: String, CaseIterable {
+    case traffic
+    case mono
+
+    var title: String {
+        switch self {
+        case .traffic: "绿 / 橙 / 红（按用量变色）"
+        case .mono: "单色（只在超过红线时变红）"
+        }
+    }
+}
+
+// MARK: - 读取配置（带默认值）
+
+extension AppConfig {
+    var resolvedPlacement: TouchBarPlacement {
+        placement.flatMap(TouchBarPlacement.init(rawValue:)) ?? .expandOnLaunch
+    }
+    var resolvedControlStripStyle: ControlStripStyle {
+        controlStripStyle.flatMap(ControlStripStyle.init(rawValue:)) ?? .gauge
+    }
+    var resolvedPrimaryMetric: PrimaryMetric {
+        primaryMetric.flatMap(PrimaryMetric.init(rawValue:)) ?? .fiveHour
+    }
+    var resolvedColorScheme: UsageColorScheme {
+        colorScheme.flatMap(UsageColorScheme.init(rawValue:)) ?? .traffic
+    }
+    var resolvedCenterContent: Bool { centerContent ?? true }
+    var resolvedShowResetCountdown: Bool { showResetCountdown ?? true }
+    var resolvedShowSecondaryMetric: Bool { showSecondaryMetric ?? true }
+    var resolvedShowMenuBar: Bool { showMenuBar ?? true }
+    /// 菜单栏和 Touch Bar 按钮不能同时隐藏，否则就没有入口打开设置了。
+    var resolvedShowTouchBarButtons: Bool { (showTouchBarButtons ?? true) || !resolvedShowMenuBar }
+    var resolvedWarnThreshold: Double { warnThreshold ?? 60 }
+    var resolvedDangerThreshold: Double { max(dangerThreshold ?? 85, resolvedWarnThreshold + 1) }
+    var resolvedRefreshInterval: Double { max(5, refreshInterval ?? 20) }
+}
+
+/// 根据“主要指标”设置取出要突出显示的那一组数字。
+extension UsageSnapshot {
+    struct Metric {
+        let percent: Double?
+        let resetAt: Date?
+        let shortLabel: String
+    }
+
+    var primaryMetric: Metric {
+        switch AppConfig.shared.resolvedPrimaryMetric {
+        case .fiveHour: Metric(percent: dailyPercent, resetAt: dailyResetAt, shortLabel: "5h")
+        case .weekly: Metric(percent: weeklyPercent, resetAt: weeklyResetAt, shortLabel: "W")
+        }
+    }
+
+    var secondaryMetric: Metric {
+        switch AppConfig.shared.resolvedPrimaryMetric {
+        case .fiveHour: Metric(percent: weeklyPercent, resetAt: weeklyResetAt, shortLabel: "W")
+        case .weekly: Metric(percent: dailyPercent, resetAt: dailyResetAt, shortLabel: "5h")
+        }
+    }
+}
+
+// MARK: - 登录时自动启动
+
+@MainActor
+enum LaunchAtLogin {
+    static var isEnabled: Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
+    /// 返回 nil 表示成功，否则返回错误说明。
+    static func set(_ enabled: Bool) -> String? {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+}
+
+// MARK: - 设置窗口
+
+/// 两页：显示设置 + 排序（沿用原来的 Arrange 页）。
+@MainActor
+final class SettingsWindowController: NSWindowController {
+    private let displayVC: DisplaySettingsViewController
+    private let arrangeVC: ArrangeViewController
+
+    init(onChange: @escaping () -> Void,
+         onArrange: @escaping ([(provider: Provider, enabled: Bool)]) -> Void) {
+        displayVC = DisplaySettingsViewController(onChange: onChange)
+        arrangeVC = ArrangeViewController(onApply: onArrange)
+
+        let tabs = NSTabViewController()
+        tabs.tabStyle = .segmentedControlOnTop
+        let displayItem = NSTabViewItem(viewController: displayVC)
+        displayItem.label = "显示设置"
+        let arrangeItem = NSTabViewItem(viewController: arrangeVC)
+        arrangeItem.label = "显示哪些 / 排序"
+        tabs.addTabViewItem(displayItem)
+        tabs.addTabViewItem(arrangeItem)
+
+        let window = NSWindow(contentViewController: tabs)
+        window.title = "Usage Touch Bar 设置"
+        window.styleMask = [.titled, .closable]
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func present() {
+        displayVC.reload()
+        arrangeVC.refresh()
+        window?.center()
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+@MainActor
+final class DisplaySettingsViewController: NSViewController {
+    private let onChange: () -> Void
+
+    private let placementPopup = NSPopUpButton()
+    private let alignPopup = NSPopUpButton()
+    private let stripStylePopup = NSPopUpButton()
+    private let metricPopup = NSPopUpButton()
+    private let colorPopup = NSPopUpButton()
+    private let warnPopup = NSPopUpButton()
+    private let dangerPopup = NSPopUpButton()
+    private let intervalPopup = NSPopUpButton()
+    private let resetSwitch = NSSwitch()
+    private let secondarySwitch = NSSwitch()
+    private let buttonsSwitch = NSSwitch()
+    private let menuBarSwitch = NSSwitch()
+    private let loginSwitch = NSSwitch()
+    private let statusLabel = NSTextField(wrappingLabelWithString: "")
+
+    private let warnChoices: [Double] = [40, 50, 60, 70, 75, 80]
+    private let dangerChoices: [Double] = [70, 80, 85, 90, 95]
+    private let intervalChoices: [(seconds: Double, title: String)] = [
+        (10, "10 秒"), (20, "20 秒"), (30, "30 秒"), (60, "1 分钟"), (120, "2 分钟"), (300, "5 分钟")
+    ]
+
+    init(onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        placementPopup.addItems(withTitles: TouchBarPlacement.allCases.map(\.title))
+        alignPopup.addItems(withTitles: ["居中", "靠左"])
+        stripStylePopup.addItems(withTitles: ControlStripStyle.allCases.map(\.title))
+        metricPopup.addItems(withTitles: PrimaryMetric.allCases.map(\.title))
+        colorPopup.addItems(withTitles: UsageColorScheme.allCases.map(\.title))
+        warnPopup.addItems(withTitles: warnChoices.map { "\(Int($0))%" })
+        dangerPopup.addItems(withTitles: dangerChoices.map { "\(Int($0))%" })
+        intervalPopup.addItems(withTitles: intervalChoices.map(\.title))
+
+        for control in [placementPopup, alignPopup, stripStylePopup, metricPopup, colorPopup,
+                        warnPopup, dangerPopup, intervalPopup] as [NSControl] {
+            control.target = self
+            control.action = #selector(valueChanged(_:))
+        }
+        for toggle in [resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch] {
+            toggle.target = self
+            toggle.action = #selector(valueChanged(_:))
+        }
+        loginSwitch.target = self
+        loginSwitch.action = #selector(loginChanged(_:))
+
+        func label(_ text: String) -> NSTextField {
+            let field = NSTextField(labelWithString: text)
+            field.alignment = .right
+            return field
+        }
+        func section(_ text: String) -> NSTextField {
+            let field = NSTextField(labelWithString: text)
+            field.font = .systemFont(ofSize: 13, weight: .semibold)
+            return field
+        }
+        let empty = { NSGridCell.emptyContentView }
+
+        let grid = NSGridView(views: [
+            [section("Touch Bar"), empty()],
+            [label("显示位置："), placementPopup],
+            [label("展开后内容："), alignPopup],
+            [label("Control Strip 样式："), stripStylePopup],
+            [label("刷新 / 设置按钮："), buttonsSwitch],
+            [section("显示内容"), empty()],
+            [label("主要显示："), metricPopup],
+            [label("同时显示另一项额度："), secondarySwitch],
+            [label("显示重置倒计时："), resetSwitch],
+            [section("颜色"), empty()],
+            [label("配色："), colorPopup],
+            [label("超过多少变橙色："), warnPopup],
+            [label("超过多少变红色："), dangerPopup],
+            [section("其他"), empty()],
+            [label("刷新间隔："), intervalPopup],
+            [label("菜单栏显示用量文字："), menuBarSwitch],
+            [label("登录时自动启动："), loginSwitch],
+        ])
+        grid.rowSpacing = 9
+        grid.columnSpacing = 10
+        grid.column(at: 0).xPlacement = .trailing
+        grid.rowAlignment = .firstBaseline
+        for row in [0, 5, 9, 13] {
+            grid.row(at: row).topPadding = row == 0 ? 0 : 8
+            grid.row(at: row).cell(at: 0).xPlacement = .leading
+            grid.row(at: row).mergeCells(in: NSRange(location: 0, length: 2))
+        }
+        for toggle in [resetSwitch, secondarySwitch, buttonsSwitch, menuBarSwitch, loginSwitch] {
+            grid.cell(for: toggle)?.yPlacement = .center
+        }
+        grid.translatesAutoresizingMaskIntoConstraints = false
+
+        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.preferredMaxLayoutWidth = 420
+        statusLabel.stringValue = "修改后立即生效，保存在 ~/.config/usage-touchbar/config.json。"
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSView()
+        root.addSubview(grid)
+        root.addSubview(statusLabel)
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
+            grid.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            grid.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -24),
+            statusLabel.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 16),
+            statusLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            statusLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+            statusLabel.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20),
+            root.widthAnchor.constraint(greaterThanOrEqualToConstant: 480),
+        ])
+        view = root
+        reload()
+    }
+
+    /// 把当前保存的配置同步到界面上。
+    func reload() {
+        guard isViewLoaded else { return }
+        let config = AppConfig.shared
+        placementPopup.selectItem(at: TouchBarPlacement.allCases.firstIndex(of: config.resolvedPlacement) ?? 0)
+        alignPopup.selectItem(at: config.resolvedCenterContent ? 0 : 1)
+        stripStylePopup.selectItem(at: ControlStripStyle.allCases.firstIndex(of: config.resolvedControlStripStyle) ?? 0)
+        metricPopup.selectItem(at: PrimaryMetric.allCases.firstIndex(of: config.resolvedPrimaryMetric) ?? 0)
+        colorPopup.selectItem(at: UsageColorScheme.allCases.firstIndex(of: config.resolvedColorScheme) ?? 0)
+        warnPopup.selectItem(at: Self.nearestIndex(of: config.resolvedWarnThreshold, in: warnChoices))
+        dangerPopup.selectItem(at: Self.nearestIndex(of: config.resolvedDangerThreshold, in: dangerChoices))
+        intervalPopup.selectItem(at: Self.nearestIndex(of: config.resolvedRefreshInterval, in: intervalChoices.map(\.seconds)))
+        resetSwitch.state = config.resolvedShowResetCountdown ? .on : .off
+        secondarySwitch.state = config.resolvedShowSecondaryMetric ? .on : .off
+        buttonsSwitch.state = (config.showTouchBarButtons ?? true) ? .on : .off
+        menuBarSwitch.state = config.resolvedShowMenuBar ? .on : .off
+        loginSwitch.state = LaunchAtLogin.isEnabled ? .on : .off
+    }
+
+    private static func nearestIndex(of value: Double, in choices: [Double]) -> Int {
+        choices.indices.min { abs(choices[$0] - value) < abs(choices[$1] - value) } ?? 0
+    }
+
+    @objc private func valueChanged(_ sender: Any?) {
+        var config = AppConfig.shared
+        config.placement = TouchBarPlacement.allCases[max(0, placementPopup.indexOfSelectedItem)].rawValue
+        config.centerContent = alignPopup.indexOfSelectedItem == 0
+        config.controlStripStyle = ControlStripStyle.allCases[max(0, stripStylePopup.indexOfSelectedItem)].rawValue
+        config.primaryMetric = PrimaryMetric.allCases[max(0, metricPopup.indexOfSelectedItem)].rawValue
+        config.colorScheme = UsageColorScheme.allCases[max(0, colorPopup.indexOfSelectedItem)].rawValue
+        config.warnThreshold = warnChoices[max(0, warnPopup.indexOfSelectedItem)]
+        config.dangerThreshold = dangerChoices[max(0, dangerPopup.indexOfSelectedItem)]
+        config.refreshInterval = intervalChoices[max(0, intervalPopup.indexOfSelectedItem)].seconds
+        config.showResetCountdown = resetSwitch.state == .on
+        config.showSecondaryMetric = secondarySwitch.state == .on
+        config.showTouchBarButtons = buttonsSwitch.state == .on
+        config.showMenuBar = menuBarSwitch.state == .on
+
+        var notes: [String] = []
+        if config.dangerThreshold! <= config.warnThreshold! {
+            notes.append("红色阈值需要高于橙色阈值，已自动按橙色阈值 +1% 处理。")
+        }
+        if !config.resolvedShowMenuBar && config.showTouchBarButtons == false {
+            notes.append("菜单栏和 Touch Bar 按钮不能同时隐藏，已保留 Touch Bar 上的设置按钮。")
+        }
+        if !config.resolvedShowMenuBar {
+            notes.append("菜单栏隐藏后，可在 Finder 里再次双击打开本 App 来进入设置。")
+        }
+
+        if AppConfig.save(config) {
+            statusLabel.stringValue = notes.isEmpty ? "已保存，立即生效。" : notes.joined(separator: "\n")
+        } else {
+            statusLabel.stringValue = "保存失败：无法写入 ~/.config/usage-touchbar/config.json"
+        }
+        onChange()
+    }
+
+    @objc private func loginChanged(_ sender: NSSwitch) {
+        if let error = LaunchAtLogin.set(sender.state == .on) {
+            statusLabel.stringValue = "设置开机启动失败：\(error)\n可以在「系统设置 › 通用 › 登录项」里手动添加。"
+        } else {
+            statusLabel.stringValue = sender.state == .on ? "已设置为登录时自动启动。" : "已取消登录时自动启动。"
+        }
+        loginSwitch.state = LaunchAtLogin.isEnabled ? .on : .off
+    }
+}

@@ -1,0 +1,76 @@
+name: Build DMG
+
+# 每次推送代码，或在 Actions 页面手动点 "Run workflow"，都会：
+#   1. 做一遍安全自查（只允许官方用量接口，禁止绕过 SafeNet 发请求）
+#   2. 在 GitHub 的 macOS 机器上编译 arm64 + x86_64 通用版
+#   3. ad-hoc 签名，打包成 DMG，作为 Artifact 供下载
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Security self-check
+        run: |
+          set -euo pipefail
+          echo "== 源码中出现的所有网址 =="
+          grep -rnoE 'https?://[^" )`]+' Sources/ || true
+          # 网址只能指向这些域名
+          bad=$(grep -rhoE 'https?://[^/" )`]+' Sources/ | sed -E 's#https?://##' | sort -u \
+                | grep -vxE 'api\.anthropic\.com|chatgpt\.com|claude\.ai|opencode\.ai' || true)
+          if [ -n "$bad" ]; then echo "::error::发现未知域名: $bad"; exit 1; fi
+          # 网络请求必须走 SafeNet（白名单）
+          if grep -rn 'URLSession\.shared' Sources/ | grep -v '//' ; then
+            echo "::error::发现绕过 SafeNet 的网络调用"; exit 1
+          fi
+          if grep -rnE 'NSAppleScript|osascript|/bin/(ba|z)?sh|Process\(\)' Sources/; then
+            echo "::error::发现执行外部命令的代码"; exit 1
+          fi
+          echo "✓ 安全自查通过"
+
+      - name: Select Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_1[6-9]*.app /Applications/Xcode_2*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC/Contents/Developer"; fi
+          xcodebuild -version
+          swift --version
+
+      - name: Build universal binary
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      - name: Assemble, sign and package DMG
+        run: |
+          set -euo pipefail
+          BIN=".build/apple/Products/Release/usage-touchbar"
+          lipo -archs "$BIN"
+          APP="UsageTouchBar.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN" "$APP/Contents/MacOS/usage-touchbar"
+          cp Info.plist "$APP/Contents/Info.plist"
+          codesign --force --options runtime --identifier local.usage-touchbar --sign - "$APP/Contents/MacOS/usage-touchbar"
+          codesign --force --options runtime --identifier local.usage-touchbar --sign - "$APP"
+          codesign --verify --verbose "$APP"
+
+          STAGING=$(mktemp -d)
+          cp -R "$APP" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+          hdiutil create -volname "Usage Touch Bar" -srcfolder "$STAGING" -ov -format UDZO UsageTouchBar.dmg
+          shasum -a 256 UsageTouchBar.dmg | tee UsageTouchBar.dmg.sha256
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: UsageTouchBar-dmg
+          path: |
+            UsageTouchBar.dmg
+            UsageTouchBar.dmg.sha256
+          retention-days: 30
