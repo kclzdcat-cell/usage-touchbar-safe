@@ -19,6 +19,9 @@ struct UsageSnapshot: Sendable {
     let planLabel: String?
     let updatedAt: Date
     let error: String?
+    /// 两项额度的标签。Claude/Codex 是 5h / W；Gemini 是 Pro / Flash。
+    var primaryLabel: String? = nil
+    var secondaryLabel: String? = nil
 
     static func disconnected(_ provider: Provider) -> UsageSnapshot {
         UsageSnapshot(
@@ -55,6 +58,13 @@ enum Provider: String, CaseIterable, Sendable {
     case claude = "Claude"
     case codex = "Codex"
     case opencode = "OpenCode"
+    case gemini = "Gemini"
+    case glm = "GLM"
+
+    /// 最多同时显示几个服务（Touch Bar 宽度有限）
+    static let maxVisible = 3
+    /// 第一次使用时默认显示的服务
+    static let defaultVisible: [Provider] = [.claude, .codex]
 
     var symbol: String { rawValue }
 
@@ -64,6 +74,8 @@ enum Provider: String, CaseIterable, Sendable {
         case .claude: "CL"
         case .codex: "CX"
         case .opencode: "OC"
+        case .gemini: "GM"
+        case .glm: "GL"
         }
     }
 
@@ -72,6 +84,8 @@ enum Provider: String, CaseIterable, Sendable {
         case .claude: URL(string: "https://claude.ai/login")!
         case .codex: URL(string: "https://chatgpt.com/codex")!
         case .opencode: URL(string: "https://opencode.ai/auth")!
+        case .gemini: URL(string: "https://gemini.google.com")!
+        case .glm: URL(string: "https://bigmodel.cn/glm-coding")!
         }
     }
 
@@ -80,6 +94,8 @@ enum Provider: String, CaseIterable, Sendable {
         case .claude: NSColor(calibratedRed: 0.85, green: 0.49, blue: 0.30, alpha: 1)
         case .codex: NSColor(calibratedWhite: 0.92, alpha: 1)
         case .opencode: NSColor(calibratedRed: 0.36, green: 0.64, blue: 0.96, alpha: 1)
+        case .gemini: NSColor(calibratedRed: 0.30, green: 0.55, blue: 0.98, alpha: 1)
+        case .glm: NSColor(calibratedRed: 0.40, green: 0.42, blue: 0.98, alpha: 1)
         }
     }
 }
@@ -143,7 +159,8 @@ struct AuthState {
 enum AuthDetector {
     static func current() -> AuthState {
         AuthState(connectedProviders: Set(Provider.allCases.filter { provider in
-            authPaths(for: provider).contains { FileManager.default.fileExists(atPath: expand($0)) }
+            if provider == .glm { return GLMCredentials.current() != nil }
+            return authPaths(for: provider).contains { FileManager.default.fileExists(atPath: expand($0)) }
         }))
     }
 
@@ -167,6 +184,10 @@ enum AuthDetector {
                 "~/.config/opencode/auth.json",
                 "~/Library/Application Support/opencode/auth.json"
             ]
+        case .gemini:
+            ["~/.gemini/oauth_creds.json"]
+        case .glm:
+            []   // GLM 用 API Key，见 GLMCredentials
         }
     }
 
@@ -199,8 +220,12 @@ final class UsageStore: @unchecked Sendable {
     }
 
     func refresh() async -> [UsageSnapshot] {
+        // Gemini、GLM 只在你选择显示时才去请求（没勾选就不会连接 Google / 智谱）
+        let visible = Set(AppConfig.shared.orderedVisibleProviders)
+        let optIn: Set<Provider> = [.gemini, .glm]
+        let active = collectors.filter { !optIn.contains($0.provider) || visible.contains($0.provider) }
         let collected = await withTaskGroup(of: UsageSnapshot.self) { group in
-            for collector in collectors {
+            for collector in active {
                 group.addTask { await collector.collect() }
             }
 
@@ -741,6 +766,7 @@ struct AppConfig: Codable {
     var showInDock: Bool?
     var stripSlotPolicy: String?      // StripSlotPolicy.rawValue
     var claudeOfflineEstimate: Bool?  // 取不到实时数据时是否显示本地估算（默认不显示）
+    var glmRegion: String?            // "cn" 国内 open.bigmodel.cn / "intl" 国际 api.z.ai
     var fontSize: String?             // FontSizeOption.rawValue
     var iconSize: String?             // IconSizeOption.rawValue
     var nameColor: String?            // "#RRGGBB"，服务名称
@@ -785,11 +811,13 @@ struct AppConfig: Codable {
     /// The providers to display, honoring the configured order + enabled flags.
     /// Falls back to all providers in their declaration order when unconfigured.
     var orderedVisibleProviders: [Provider] {
-        guard let providers, !providers.isEmpty else { return Provider.allCases }
-        return providers.compactMap { setting in
+        guard let providers, !providers.isEmpty else { return Provider.defaultVisible }
+        let visible: [Provider] = providers.compactMap { setting in
             guard let provider = Self.provider(forID: setting.id) else { return nil }
             return (setting.enabled ?? true) ? provider : nil
         }
+        // 最多同时显示 3 个
+        return Array(visible.prefix(Provider.maxVisible))
     }
 
     /// All providers in their configured order (including hidden ones), with any
@@ -803,8 +831,10 @@ struct AppConfig: Codable {
             result.append((provider, setting.enabled ?? true))
             seen.insert(provider)
         }
+        // 配置里没有的服务（比如新加的 Gemini、GLM）默认不显示；从没配置过时只显示默认的几个
+        let neverConfigured = (providers ?? []).isEmpty
         for provider in Provider.allCases where !seen.contains(provider) {
-            result.append((provider, true))
+            result.append((provider, neverConfigured && Provider.defaultVisible.contains(provider)))
         }
         return result
     }
@@ -1565,7 +1595,7 @@ final class LoginViewController: NSViewController {
 
         let auth = AuthDetector.current()
         var lastRow: NSView?
-        for provider in Provider.allCases {
+        for provider in AppConfig.shared.orderedVisibleProviders {
             let providerRow = row(provider: provider, connected: auth.isConnected(provider))
             stack.addArrangedSubview(providerRow)
             lastRow = providerRow
@@ -1831,6 +1861,12 @@ final class ProviderLogoView: NSView {
         case .opencode:
             fill = selected ? NSColor(calibratedRed: 0.16, green: 0.34, blue: 0.55, alpha: 1) : NSColor(calibratedRed: 0.20, green: 0.30, blue: 0.42, alpha: 1)
             stroke = NSColor(calibratedRed: 0.55, green: 0.76, blue: 0.98, alpha: 1)
+        case .gemini:
+            fill = NSColor(calibratedRed: 0.18, green: 0.36, blue: 0.80, alpha: 1)
+            stroke = NSColor(calibratedRed: 0.60, green: 0.78, blue: 1.0, alpha: 1)
+        case .glm:
+            fill = NSColor(calibratedRed: 0.24, green: 0.24, blue: 0.70, alpha: 1)
+            stroke = NSColor(calibratedRed: 0.70, green: 0.72, blue: 1.0, alpha: 1)
         }
 
         fill.setFill()
@@ -1870,6 +1906,14 @@ enum ProviderBranding {
         case .opencode:
             bundleID = "ai.opencode.app"
             fallbackPath = "/Applications/OpenCode.app"
+        case .gemini:
+            bundleID = "com.google.GeminiMacOS"
+            fallbackPath = "/Applications/Gemini.app"
+        case .glm:
+            // ZCode 是智谱的编程工具，用的就是 GLM Coding Plan 的额度
+            bundleID = "ai.zhipu.zcode"
+            fallbackPath = FileManager.default.fileExists(atPath: "/Applications/ZCode.app")
+                ? "/Applications/ZCode.app" : "/Applications/Z Code.app"
         }
         let workspace = NSWorkspace.shared
         let url = workspace.urlForApplication(withBundleIdentifier: bundleID)
@@ -2723,6 +2767,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         AppConfig.reload()
         // 不再删掉再重新添加 Control Strip 图标（容易出现删了没加回来），直接更新内容。
         refreshTouchBar()
+        // 新勾选的服务立刻去读一次数据
+        refresh()
     }
 
     private func configureStatusItem() {
@@ -2905,7 +2951,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     /// Providers to show, in the order/visibility chosen in the config file.
     private var visibleProviders: [Provider] {
         let providers = AppConfig.shared.orderedVisibleProviders
-        return providers.isEmpty ? Provider.allCases : providers
+        return providers.isEmpty ? Provider.defaultVisible : providers
     }
 
     private func makeDetailView() -> NSView {

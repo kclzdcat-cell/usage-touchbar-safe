@@ -616,7 +616,7 @@ enum CLI {
 
     @MainActor
     private static func isOpenCodeHeuristic(_ snapshot: UsageSnapshot) -> Bool {
-        snapshot.provider == .opencode && snapshot.planLabel == "est."
+        snapshot.provider == .opencode && snapshot.planLabel == "估算"
     }
 
     // MARK: - ANSI helpers
@@ -709,7 +709,9 @@ enum CLI {
         [
             ClaudeUsageCollector(),
             CodexUsageCollector(),
-            OpenCodeUsageCollector()
+            OpenCodeUsageCollector(),
+            GeminiUsageCollector(),
+            GLMUsageCollector()
         ]
     }
 }
@@ -726,5 +728,7 @@ extension UsageStore {
         ClaudeUsageCollector.flushLiveCache()
         CodexUsageCollector.flushLiveCache()
         OpenCodeUsageCollector.flushLiveCache()
+        GeminiUsageCollector.cache.flush()
+        GLMUsageCollector.cache.flush()
     }
 }

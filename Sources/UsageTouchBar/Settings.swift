@@ -284,17 +284,24 @@ extension UsageSnapshot {
     }
 
     var primaryMetric: Metric {
-        switch AppConfig.shared.resolvedPrimaryMetric {
-        case .fiveHour: Metric(percent: dailyPercent, resetAt: dailyResetAt, shortLabel: "5h")
-        case .weekly: Metric(percent: weeklyPercent, resetAt: weeklyResetAt, shortLabel: "W")
+        let first = Metric(percent: dailyPercent, resetAt: dailyResetAt, shortLabel: primaryLabel ?? "5h")
+        let second = Metric(percent: weeklyPercent, resetAt: weeklyResetAt, shortLabel: secondaryLabel ?? "W")
+        // “主要显示：每周额度”只对有 5h / 每周两种额度的服务生效
+        if AppConfig.shared.resolvedPrimaryMetric == .weekly, primaryLabel == nil || primaryLabel == "5h",
+           weeklyPercent != nil {
+            return second
         }
+        return first
     }
 
     var secondaryMetric: Metric {
-        switch AppConfig.shared.resolvedPrimaryMetric {
-        case .fiveHour: Metric(percent: weeklyPercent, resetAt: weeklyResetAt, shortLabel: "W")
-        case .weekly: Metric(percent: dailyPercent, resetAt: dailyResetAt, shortLabel: "5h")
+        let first = Metric(percent: dailyPercent, resetAt: dailyResetAt, shortLabel: primaryLabel ?? "5h")
+        let second = Metric(percent: weeklyPercent, resetAt: weeklyResetAt, shortLabel: secondaryLabel ?? "W")
+        if AppConfig.shared.resolvedPrimaryMetric == .weekly, primaryLabel == nil || primaryLabel == "5h",
+           weeklyPercent != nil {
+            return first
         }
+        return second
     }
 }
 
@@ -488,6 +495,11 @@ final class DisplaySettingsViewController: NSViewController {
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let diagnosticsLabel = NSTextField(wrappingLabelWithString: "")
     private let claudeStatusLabel = NSTextField(wrappingLabelWithString: "")
+    private let glmKeyField = NSSecureTextField()
+    private let glmRegionPopup = NSPopUpButton()
+    private let glmSourceLabel = NSTextField(wrappingLabelWithString: "")
+    private let glmSaveButton = NSButton(title: "保存 Key", target: nil, action: nil)
+    private let geminiNote = NSTextField(wrappingLabelWithString: "")
     private let estimateSwitch = NSSwitch()
     private let addFrontAppButton = NSButton(title: "把它加入音乐 App 列表", target: nil, action: nil)
     /// 三栏设置；按窗口宽度组合成 3 栏 / 2 栏 / 1 栏
@@ -628,7 +640,7 @@ final class DisplaySettingsViewController: NSViewController {
         musicTip.preferredMaxLayoutWidth = 320
 
         let column1 = makeGrid([
-            .section("显示哪些服务（勾选显示，↑ ↓ 调整顺序）"),
+            .section("显示哪些服务（最多 3 个，↑ ↓ 调整顺序）"),
             .full(providerStack),
             .section("Touch Bar"),
             .item("显示位置：", placementPopup),
@@ -661,7 +673,16 @@ final class DisplaySettingsViewController: NSViewController {
             .item("在 Dock 显示图标：", dockSwitch),
             .item("登录时自动启动：", loginSwitch),
         ])
+        let glmKeyRow = NSStackView(views: [glmKeyField, glmSaveButton])
+        glmKeyRow.orientation = .horizontal
+        glmKeyRow.spacing = 8
         let column3 = makeGrid([
+            .section("GLM / ZCode（智谱 GLM Coding Plan）"),
+            .item("区域：", glmRegionPopup),
+            .item("API Key：", glmKeyRow),
+            .full(glmSourceLabel),
+            .section("Gemini"),
+            .full(geminiNote),
             .section("音乐 App（歌词）"),
             .item("音乐 App 在前台时：", musicModePopup),
             .item("Control Strip 图标：", slotPopup),
@@ -687,6 +708,22 @@ final class DisplaySettingsViewController: NSViewController {
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = "修改后立即生效，保存在 ~/.config/usage-touchbar/config.json。"
 
+        glmRegionPopup.addItems(withTitles: ["国内（open.bigmodel.cn）", "国际（api.z.ai）"])
+        glmRegionPopup.target = self
+        glmRegionPopup.action = #selector(glmRegionChanged(_:))
+        glmKeyField.placeholderString = "留空则自动读取 Claude Code 里的配置"
+        glmKeyField.translatesAutoresizingMaskIntoConstraints = false
+        glmKeyField.widthAnchor.constraint(equalToConstant: 210).isActive = true
+        glmSaveButton.target = self
+        glmSaveButton.action = #selector(saveGLMKey(_:))
+        glmSaveButton.bezelStyle = .rounded
+        glmSaveButton.controlSize = .small
+        for label in [glmSourceLabel, geminiNote] {
+            label.font = .systemFont(ofSize: 11)
+            label.textColor = .secondaryLabelColor
+            label.preferredMaxLayoutWidth = 340
+        }
+        geminiNote.stringValue = "读取 Gemini CLI 的登录（~/.gemini/oauth_creds.json）。没装的话先在终端安装并运行 gemini，用 Google 账号登录一次。主要显示 Pro 模型额度，次要显示 Flash。"
         claudeStatusLabel.font = .systemFont(ofSize: 12)
         claudeStatusLabel.preferredMaxLayoutWidth = 380
         diagnosticsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -872,6 +909,9 @@ final class DisplaySettingsViewController: NSViewController {
         buttonsSwitch.state = (config.showTouchBarButtons ?? true) ? .on : .off
         menuBarSwitch.state = config.resolvedShowMenuBar ? .on : .off
         dockSwitch.state = config.resolvedShowInDock ? .on : .off
+        glmRegionPopup.selectItem(at: config.glmRegion == "intl" ? 1 : 0)
+        glmKeyField.stringValue = ""
+        glmSourceLabel.stringValue = GLMCredentials.sourceDescription
         estimateSwitch.state = config.claudeOfflineEstimate == true ? .on : .off
         slotPopup.selectItem(at: StripSlotPolicy.allCases.firstIndex(of: config.resolvedStripSlotPolicy) ?? 0)
         loginSwitch.state = LaunchAtLogin.isEnabled ? .on : .off
@@ -882,13 +922,26 @@ final class DisplaySettingsViewController: NSViewController {
     }
 
     private func updateDiagnostics() {
+        var lines: [String] = []
+        var anyFailed = false
         if let status = ClaudeUsageCollector.lastStatus() {
-            claudeStatusLabel.stringValue = (status.ok ? "✓ Claude 实时用量：" : "✗ Claude 实时用量：") + status.detail
-            claudeStatusLabel.textColor = status.ok ? .secondaryLabelColor : .systemOrange
+            lines.append((status.ok ? "✓ Claude：" : "✗ Claude：") + status.detail)
+            anyFailed = anyFailed || !status.ok
         } else {
-            claudeStatusLabel.stringValue = "Claude 实时用量：还没有读取过（点 Touch Bar 上的刷新按钮可立即读取）。"
-            claudeStatusLabel.textColor = .secondaryLabelColor
+            lines.append("Claude：还没有读取过（点 Touch Bar 上的刷新按钮可立即读取）。")
         }
+        let visible = AppConfig.shared.orderedVisibleProviders
+        for (provider, cache) in [(Provider.gemini, GeminiUsageCollector.cache), (Provider.glm, GLMUsageCollector.cache)]
+            where visible.contains(provider) {
+            if let status = cache.lastStatus() {
+                lines.append((status.ok ? "✓ " : "✗ ") + provider.rawValue + "：" + status.detail)
+                anyFailed = anyFailed || !status.ok
+            } else {
+                lines.append(provider.rawValue + "：还没有读取过。")
+            }
+        }
+        claudeStatusLabel.stringValue = lines.joined(separator: "\n")
+        claudeStatusLabel.textColor = anyFailed ? .systemOrange : .secondaryLabelColor
         let name = Diagnostics.lastAppName ?? "（还没有切换过 App）"
         let id = Diagnostics.lastAppBundleID ?? "—"
         let recognized = Diagnostics.lastAppBundleID == nil ? "" : (Diagnostics.lastAppIsMusic ? "✓ 已识别为音乐 App" : "✗ 不在音乐 App 列表里")
@@ -972,6 +1025,11 @@ final class DisplaySettingsViewController: NSViewController {
 
     @objc private func providerToggled(_ sender: NSButton) {
         guard arrangement.indices.contains(sender.tag) else { return }
+        if sender.state == .on, arrangement.filter(\.enabled).count >= Provider.maxVisible {
+            sender.state = .off
+            statusLabel.stringValue = "最多同时显示 \(Provider.maxVisible) 个服务（Touch Bar 放不下更多），先取消勾选一个。"
+            return
+        }
         arrangement[sender.tag].enabled = sender.state == .on
         if !arrangement.contains(where: { $0.enabled }) {
             arrangement[sender.tag].enabled = true
@@ -1001,6 +1059,32 @@ final class DisplaySettingsViewController: NSViewController {
     private func commitArrangement() {
         onArrange(arrangement)
         statusLabel.stringValue = "已保存，立即生效。"
+    }
+
+    // MARK: GLM
+
+    @objc private func saveGLMKey(_ sender: Any?) {
+        let key = glmKeyField.stringValue
+        if GLMCredentials.saveKey(key) {
+            statusLabel.stringValue = key.isEmpty ? "已清除填写的 Key，改为自动读取 Claude Code 的配置。" : "已保存 GLM API Key（只保存在你电脑上，文件权限仅你自己可读）。"
+        } else {
+            statusLabel.stringValue = "保存 Key 失败。"
+        }
+        glmKeyField.stringValue = ""
+        glmSourceLabel.stringValue = GLMCredentials.sourceDescription
+        GLMUsageCollector.cache.flush()
+        onChange()
+    }
+
+    @objc private func glmRegionChanged(_ sender: Any?) {
+        var config = AppConfig.shared
+        config.glmRegion = glmRegionPopup.indexOfSelectedItem == 1 ? "intl" : "cn"
+        AppConfig.save(config)
+        GLMCredentials.invalidate()
+        GLMUsageCollector.cache.flush()
+        glmSourceLabel.stringValue = GLMCredentials.sourceDescription
+        statusLabel.stringValue = "已切换 GLM 区域。"
+        onChange()
     }
 
     // MARK: 其他设置

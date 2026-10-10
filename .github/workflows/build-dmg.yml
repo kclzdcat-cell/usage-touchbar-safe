@@ -25,7 +25,7 @@ jobs:
           grep -rnoE 'https?://[^" )`]+' Sources/ || true
           # 网址只能指向这些域名
           bad=$(grep -rhoE 'https?://[^/" )`]+' Sources/ | sed -E 's#https?://##' | sort -u \
-                | grep -vxE 'api\.anthropic\.com|chatgpt\.com|claude\.ai|opencode\.ai' || true)
+                | grep -vxE 'api\.anthropic\.com|chatgpt\.com|claude\.ai|opencode\.ai|open\.bigmodel\.cn|bigmodel\.cn|api\.z\.ai|z\.ai|cloudcode-pa\.googleapis\.com|oauth2\.googleapis\.com|gemini\.google\.com' || true)
           if [ -n "$bad" ]; then echo "::error::发现未知域名: $bad"; exit 1; fi
           # 网络请求必须走 SafeNet（白名单）
           if grep -rn 'URLSession\.shared' Sources/ | grep -v '//' ; then
