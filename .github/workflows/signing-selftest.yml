@@ -17,6 +17,7 @@ jobs:
           wc -c "$RUNNER_TEMP/p12.b64"
       - name: Import and sign twice (two different binaries), compare requirements
         run: |
+          set +e
           note() { echo "::notice::$1: $(echo "$2" | tr '\n' ' ' | cut -c1-400)"; }
           SIGNING_P12=$(cat "$RUNNER_TEMP/p12.b64")
           KC="$RUNNER_TEMP/signing.keychain-db"; KC_PASS="$(uuidgen)"
@@ -39,7 +40,9 @@ jobs:
             note "sign$v-bin" "$(codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP/Contents/MacOS/usage-touchbar" 2>&1; echo rc=$?)"
             note "sign$v-app" "$(codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP" 2>&1; echo rc=$?)"
             note "verify$v" "$(codesign --verify --verbose "$APP" 2>&1; echo rc=$?)"
-            codesign -d -r- "$APP" 2>&1 | grep designated > "dr$v.txt"
+            codesign -d -r- "$APP" > "raw$v.txt" 2>&1 || true
+            note "raw$v" "$(cat raw$v.txt)"
+            grep -i designated "raw$v.txt" | sed 's/^#* *//' > "dr$v.txt" || true
             note "dr$v" "$(cat dr$v.txt)"
             note "cdhash$v" "$(codesign -dvvv "$APP" 2>&1 | grep -E 'CDHash=|Authority')"
           done
