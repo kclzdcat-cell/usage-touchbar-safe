@@ -17,26 +17,30 @@ jobs:
           wc -c "$RUNNER_TEMP/p12.b64"
       - name: Import and sign twice (two different binaries), compare requirements
         run: |
-          set -euo pipefail
+          note() { echo "::notice::$1: $(echo "$2" | tr '\n' ' ' | cut -c1-400)"; }
           SIGNING_P12=$(cat "$RUNNER_TEMP/p12.b64")
           KC="$RUNNER_TEMP/signing.keychain-db"; KC_PASS="$(uuidgen)"
           echo "$SIGNING_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
-          security create-keychain -p "$KC_PASS" "$KC"
+          note p12size "$(wc -c < "$RUNNER_TEMP/signing.p12")"
+          note create "$(security create-keychain -p "$KC_PASS" "$KC" 2>&1; echo rc=$?)"
           security set-keychain-settings "$KC"
-          security unlock-keychain -p "$KC_PASS" "$KC"
-          security import "$RUNNER_TEMP/signing.p12" -k "$KC" -P usagetouchbar -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          note unlock "$(security unlock-keychain -p "$KC_PASS" "$KC" 2>&1; echo rc=$?)"
+          note import "$(security import "$RUNNER_TEMP/signing.p12" -k "$KC" -P usagetouchbar -T /usr/bin/codesign 2>&1; echo rc=$?)"
+          note partition "$(security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" 2>&1 | tail -2; echo rc=$?)"
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          note identities "$(security find-identity -p codesigning "$KC" 2>&1)"
           IDENTITY=$(security find-certificate -c "UsageTouchBar Signing" -Z "$KC" | awk '/SHA-1 hash:/ { print $3; exit }')
-          echo "identity=$IDENTITY"
+          note identity "$IDENTITY"
           for v in 1 2; do
             APP="T$v.app"; mkdir -p "$APP/Contents/MacOS"
-            cp /bin/echo "$APP/Contents/MacOS/usage-touchbar"; echo "v$v" >> "$APP/Contents/MacOS/usage-touchbar" || true
+            cp /bin/echo "$APP/Contents/MacOS/usage-touchbar"; chmod u+w "$APP/Contents/MacOS/usage-touchbar"
+            printf "v$v" >> "$APP/Contents/MacOS/usage-touchbar"
             cp Info.plist "$APP/Contents/Info.plist"
-            codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP/Contents/MacOS/usage-touchbar" || codesign --force --identifier local.usage-touchbar --sign "$IDENTITY" "$APP/Contents/MacOS/usage-touchbar"
-            codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP"
-            codesign --verify --verbose "$APP"
-            codesign -d -r- "$APP" 2>&1 | grep designated | tee "dr$v.txt"
-            codesign -dvvv "$APP" 2>&1 | grep -E 'CDHash|Authority|Identifier'
+            note "sign$v-bin" "$(codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP/Contents/MacOS/usage-touchbar" 2>&1; echo rc=$?)"
+            note "sign$v-app" "$(codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP" 2>&1; echo rc=$?)"
+            note "verify$v" "$(codesign --verify --verbose "$APP" 2>&1; echo rc=$?)"
+            codesign -d -r- "$APP" 2>&1 | grep designated > "dr$v.txt"
+            note "dr$v" "$(cat dr$v.txt)"
+            note "cdhash$v" "$(codesign -dvvv "$APP" 2>&1 | grep -E 'CDHash=|Authority')"
           done
-          if diff dr1.txt dr2.txt; then echo "SAME_REQUIREMENT_OK"; else echo "::error::requirements differ"; exit 1; fi
+          if diff dr1.txt dr2.txt && [ -s dr1.txt ]; then note result SAME_REQUIREMENT_OK; else echo "::error::requirements differ or empty"; exit 1; fi
