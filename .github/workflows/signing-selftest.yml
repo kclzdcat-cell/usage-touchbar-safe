@@ -33,8 +33,8 @@ jobs:
           note identity "$IDENTITY"
           for v in 1 2; do
             APP="T$v.app"; mkdir -p "$APP/Contents/MacOS"
-            cp /bin/echo "$APP/Contents/MacOS/usage-touchbar"; chmod u+w "$APP/Contents/MacOS/usage-touchbar"
-            printf "v$v" >> "$APP/Contents/MacOS/usage-touchbar"
+            if [ $v = 1 ]; then SRC=/bin/echo; else SRC=/bin/cat; fi
+            cp "$SRC" "$APP/Contents/MacOS/usage-touchbar"; chmod u+w "$APP/Contents/MacOS/usage-touchbar"
             cp Info.plist "$APP/Contents/Info.plist"
             note "sign$v-bin" "$(codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP/Contents/MacOS/usage-touchbar" 2>&1; echo rc=$?)"
             note "sign$v-app" "$(codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP" 2>&1; echo rc=$?)"
