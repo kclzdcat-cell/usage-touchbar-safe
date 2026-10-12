@@ -1,0 +1,42 @@
+name: Signing self-test (temporary)
+on:
+  push:
+    paths: ['.github/workflows/signing-selftest.yml']
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Generate throwaway cert with the user script (pbcopy -> file)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\ncat > "%s/p12.b64"\n' "$RUNNER_TEMP" > "$RUNNER_TEMP/bin/pbcopy"
+          chmod +x "$RUNNER_TEMP/bin/pbcopy"
+          PATH="$RUNNER_TEMP/bin:$PATH" bash scripts/make-signing-secret.sh
+          wc -c "$RUNNER_TEMP/p12.b64"
+      - name: Import and sign twice (two different binaries), compare requirements
+        run: |
+          set -euo pipefail
+          SIGNING_P12=$(cat "$RUNNER_TEMP/p12.b64")
+          KC="$RUNNER_TEMP/signing.keychain-db"; KC_PASS="$(uuidgen)"
+          echo "$SIGNING_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KC" -P usagetouchbar -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          IDENTITY=$(security find-certificate -c "UsageTouchBar Signing" -Z "$KC" | awk '/SHA-1 hash:/ { print $3; exit }')
+          echo "identity=$IDENTITY"
+          for v in 1 2; do
+            APP="T$v.app"; mkdir -p "$APP/Contents/MacOS"
+            cp /bin/echo "$APP/Contents/MacOS/usage-touchbar"; echo "v$v" >> "$APP/Contents/MacOS/usage-touchbar" || true
+            cp Info.plist "$APP/Contents/Info.plist"
+            codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP/Contents/MacOS/usage-touchbar" || codesign --force --identifier local.usage-touchbar --sign "$IDENTITY" "$APP/Contents/MacOS/usage-touchbar"
+            codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP"
+            codesign --verify --verbose "$APP"
+            codesign -d -r- "$APP" 2>&1 | grep designated | tee "dr$v.txt"
+            codesign -dvvv "$APP" 2>&1 | grep -E 'CDHash|Authority|Identifier'
+          done
+          if diff dr1.txt dr2.txt; then echo "SAME_REQUIREMENT_OK"; else echo "::error::requirements differ"; exit 1; fi

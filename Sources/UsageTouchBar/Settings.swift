@@ -522,6 +522,7 @@ final class DisplaySettingsViewController: NSViewController {
     private let glmSourceLabel = NSTextField(wrappingLabelWithString: "")
     private let geminiNote = NSTextField(wrappingLabelWithString: "")
     private let estimateSwitch = NSSwitch()
+    private let keychainButton = NSButton(title: "授权钥匙串…", target: nil, action: nil)
     private let addFrontAppButton = NSButton(title: "把它加入音乐 App 列表", target: nil, action: nil)
     // 账号页：需要填 API Key 的服务
     private let kimiKeyField = NSSecureTextField()
@@ -622,6 +623,7 @@ final class DisplaySettingsViewController: NSViewController {
                 .full(providerStack),
                 .section("读取状态"),
                 .full(claudeStatusLabel),
+                .item("Claude 钥匙串：", keychainButton),
                 .item("取不到实时数据时显示本地估算：", estimateSwitch),
             ]),
             ("账号", "key", [
@@ -745,6 +747,10 @@ final class DisplaySettingsViewController: NSViewController {
         claudeStatusLabel.preferredMaxLayoutWidth = 480
         diagnosticsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         diagnosticsLabel.preferredMaxLayoutWidth = 480
+        keychainButton.target = self
+        keychainButton.action = #selector(authorizeKeychain(_:))
+        keychainButton.bezelStyle = .rounded
+        keychainButton.controlSize = .small
         addFrontAppButton.target = self
         addFrontAppButton.action = #selector(addFrontApp(_:))
         addFrontAppButton.bezelStyle = .rounded
@@ -1076,6 +1082,21 @@ final class DisplaySettingsViewController: NSViewController {
         field.stringValue = ""
         updateAccountLabels()
         onChange()
+    }
+
+    @objc private func authorizeKeychain(_ sender: Any?) {
+        statusLabel.stringValue = "请在弹出的窗口里输入登录密码，并选「始终允许」。"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = ClaudeCredentials.authorize()
+            DispatchQueue.main.async { [weak self] in
+                self?.statusLabel.stringValue = ok
+                    ? "已授权。只要选的是「始终允许」，这个版本以后都不会再问。"
+                    : "没有授权成功（可能点了「拒绝」，或 Claude Code 还没登录）。"
+                ClaudeUsageCollector.clearFailure()
+                ClaudeUsageCollector.expireCache()
+                self?.onChange()
+            }
+        }
     }
 
     @objc private func otherRegionChanged(_ sender: NSPopUpButton) {

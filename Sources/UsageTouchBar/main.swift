@@ -910,6 +910,31 @@ enum ClaudeCredentials {
 
     private static let lock = NSLock()
     private nonisolated(unsafe) static var cached: OAuth?
+    /// 下一次读钥匙串时允许弹出授权窗口（只在你主动操作时打开：启动、点刷新、点「授权」）。
+    private nonisolated(unsafe) static var promptAllowed = false
+    /// 后台读取时因为还没授权而被拦下（为了不在后台突然弹窗）。
+    private nonisolated(unsafe) static var blockedByPrompt = false
+
+    /// 允许下一次读取弹出钥匙串授权窗口。
+    static func allowPromptOnce() {
+        lock.withLock { promptAllowed = true }
+    }
+
+    /// 还需要你在钥匙串弹窗里授权。
+    static var needsAuthorization: Bool {
+        lock.withLock { blockedByPrompt }
+    }
+
+    /// 主动授权：立刻读一次钥匙串（会弹窗），成功返回 true。
+    @discardableResult
+    static func authorize() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        promptAllowed = true
+        guard let fresh = read() else { return false }
+        cached = fresh
+        return true
+    }
 
     static func current() -> OAuth? {
         lock.lock()
@@ -921,9 +946,9 @@ enum ClaudeCredentials {
         }
 
         guard let fresh = read() else {
-            // Keychain unavailable this time (e.g. user clicked Deny): keep using
-            // the last good token if we still have one rather than failing hard.
-            return cached
+            // 读不到新的：上一个令牌还没过期就继续用
+            if let cached, let expiry = cached.expiryDate, expiry > Date() { return cached }
+            return nil
         }
         cached = fresh
         return fresh
@@ -953,17 +978,30 @@ enum ClaudeCredentials {
     }
 
     private static func readFromKeychain() -> OAuth? {
-        let query: [String: Any] = [
+        let interactive = promptAllowed
+        promptAllowed = false
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
+        if !interactive {
+            // 后台读取：还没授权就直接失败，绝不在后台（比如刚唤醒时）突然弹窗要密码
+            query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+            SecKeychainSetUserInteractionAllowed(false)
+        }
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else {
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if !interactive {
+            SecKeychainSetUserInteractionAllowed(true)
+        }
+        let needsUI = status == errSecInteractionNotAllowed || status == errSecAuthFailed
+        blockedByPrompt = !interactive && needsUI
+        guard status == errSecSuccess, let data = item as? Data else {
             return nil
         }
+        blockedByPrompt = false
         return try? JSONDecoder().decode(Wrapper.self, from: data).claudeAiOauth
     }
 }
@@ -1115,6 +1153,11 @@ struct ClaudeUsageCollector: UsageCollecting {
 
     private func liveSnapshot() async -> UsageSnapshot? {
         guard let credentials = ClaudeCredentials.current() else {
+            if ClaudeCredentials.needsAuthorization {
+                Self.record(ok: false, short: "需要授权",
+                            detail: "需要允许读取钥匙串里的 Claude Code 登录。点设置「服务」页的「授权钥匙串」，或点 Touch Bar 上的刷新按钮；弹窗里选「始终允许」，以后就不会再问。")
+                return nil
+            }
             Self.record(ok: false, short: "读不到登录",
                         detail: "读不到 Claude Code 的登录信息。可能是钥匙串授权被拒绝（重新打开 App，弹窗时点「允许」），或者 Claude Code 还没登录（在终端运行 claude 登录一次）。")
             return nil
@@ -2527,8 +2570,77 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         updateCodexSessionWatcher()
         updateOpenCodeDBWatcher()
         startFrontmostAppWatcher()
+        startPowerObservers()
+        if mode == .launcher {
+            // 启动时允许弹一次钥匙串授权（之后后台读取都不会再弹）
+            ClaudeCredentials.allowPromptOnce()
+        }
         refresh()
         restartTimers()
+    }
+
+    // MARK: 睡眠 / 锁屏时暂停
+
+    /// 当前暂停的原因（睡眠、熄屏、锁屏、切换用户）。只要有任何一个原因就不读取。
+    private var suspendReasons = Set<String>()
+    private var powerObservers: [(NotificationCenter, NSObjectProtocol)] = []
+    private var isSuspended: Bool { !suspendReasons.isEmpty }
+
+    private func startPowerObservers() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        let distributed = DistributedNotificationCenter.default()
+        let pairs: [(NotificationCenter, Notification.Name, String, Bool)] = [
+            (workspace, NSWorkspace.willSleepNotification, "sleep", true),
+            (workspace, NSWorkspace.didWakeNotification, "sleep", false),
+            (workspace, NSWorkspace.screensDidSleepNotification, "display", true),
+            (workspace, NSWorkspace.screensDidWakeNotification, "display", false),
+            (workspace, NSWorkspace.sessionDidResignActiveNotification, "session", true),
+            (workspace, NSWorkspace.sessionDidBecomeActiveNotification, "session", false),
+            (distributed, Notification.Name("com.apple.screenIsLocked"), "lock", true),
+            (distributed, Notification.Name("com.apple.screenIsUnlocked"), "lock", false),
+        ]
+        for (center, name, reason, suspend) in pairs {
+            let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    if suspend { self?.suspend(reason) } else { self?.resume(reason) }
+                }
+            }
+            powerObservers.append((center, token))
+        }
+    }
+
+    private func suspend(_ reason: String) {
+        let wasSuspended = isSuspended
+        suspendReasons.insert(reason)
+        // 系统睡眠时，熄屏 / 锁屏的状态也会在唤醒时重新通知，这里一起记上
+        if reason == "sleep" { suspendReasons.insert("display") }
+        guard !wasSuspended else { return }
+        timer?.invalidate()
+        timer = nil
+        pinTimer?.invalidate()
+        pinTimer = nil
+        stopStripReclaimLoop()
+    }
+
+    private func resume(_ reason: String) {
+        suspendReasons.remove(reason)
+        if reason == "sleep" {
+            // 唤醒后屏幕通常也会亮；如果 5 秒内没收到“屏幕亮了”，就当作已经亮了
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.suspendReasons == ["display"] else { return }
+                self.resume("display")
+            }
+        }
+        guard !isSuspended else { return }
+        restartTimers()
+        if musicAppActive, AppConfig.shared.resolvedMusicMode == .iconOnly,
+           AppConfig.shared.resolvedStripSlotPolicy != .never {
+            startStripReclaimLoop()
+        }
+        // 刚唤醒时网络可能还没连上，等几秒再刷新
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.refresh()
+        }
     }
 
     // MARK: 音乐 App 适配
@@ -2573,6 +2685,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private var stripReclaimTimer: Timer?
 
     private func startStripReclaimLoop() {
+        guard !isSuspended else { return }
         stripReclaimTimer?.invalidate()
         // 切换后输入法会稍晚一点重新申请，所以分几次补申请
         for delay in [0.4, 1.2, 2.5] {
@@ -2662,6 +2775,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     /// 按配置的刷新间隔重建定时器；“常驻展开”模式额外每 3 秒检查一次是否被收起。
     private func restartTimers() {
+        guard !isSuspended else { return }
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: AppConfig.shared.resolvedRefreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
@@ -2771,6 +2885,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         pinTimer?.invalidate()
         pinTimer = nil
         stopStripReclaimLoop()
+        for (center, token) in powerObservers { center.removeObserver(token) }
+        powerObservers.removeAll()
         if let appActivationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
         }
@@ -3338,6 +3454,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     @objc private func refreshButtonPressed() {
+        // 你主动点刷新时，如果还没授权，允许弹一次钥匙串授权
+        ClaudeCredentials.allowPromptOnce()
         ClaudeUsageCollector.clearFailure()
         ClaudeUsageCollector.expireCache()
         CodexUsageCollector.expireCache()
@@ -3818,6 +3936,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     private func refresh() {
+        guard !isSuspended else { return }
         if isRefreshing {
             refreshAgainAfterCurrent = true
             return

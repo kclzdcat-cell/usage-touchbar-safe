@@ -58,6 +58,10 @@ jobs:
           fi
 
       - name: Assemble, sign and package DMG
+        env:
+          # 固定签名证书（scripts/make-signing-secret.sh 生成）。有了它，钥匙串的
+          # 「始终允许」在每次更新后都会继续有效；没有就退回 ad-hoc 签名。
+          SIGNING_P12: ${{ secrets.SIGNING_P12 }}
         run: |
           set -euo pipefail
           BIN=".build/apple/Products/Release/usage-touchbar"
@@ -68,9 +72,30 @@ jobs:
           cp "$BIN" "$APP/Contents/MacOS/usage-touchbar"
           cp Info.plist "$APP/Contents/Info.plist"
           iconutil -c icns Resources/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
-          codesign --force --options runtime --identifier local.usage-touchbar --sign - "$APP/Contents/MacOS/usage-touchbar"
-          codesign --force --options runtime --identifier local.usage-touchbar --sign - "$APP"
+
+          IDENTITY="-"
+          if [ -n "${SIGNING_P12:-}" ]; then
+            KC="$RUNNER_TEMP/signing.keychain-db"
+            KC_PASS="$(uuidgen)"
+            echo "$SIGNING_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+            security create-keychain -p "$KC_PASS" "$KC"
+            security set-keychain-settings "$KC"
+            security unlock-keychain -p "$KC_PASS" "$KC"
+            security import "$RUNNER_TEMP/signing.p12" -k "$KC" -P usagetouchbar -T /usr/bin/codesign >/dev/null
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+            security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+            rm -f "$RUNNER_TEMP/signing.p12"
+            IDENTITY=$(security find-certificate -c "UsageTouchBar Signing" -Z "$KC" | awk '/SHA-1 hash:/ { print $3; exit }')
+            echo "使用固定签名证书：$IDENTITY"
+          else
+            echo "::warning::没有设置 SIGNING_P12，使用 ad-hoc 签名：每次更新后钥匙串都需要重新授权。运行 scripts/make-signing-secret.sh 可以解决。"
+          fi
+
+          codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP/Contents/MacOS/usage-touchbar"
+          codesign --force --options runtime --identifier local.usage-touchbar --sign "$IDENTITY" "$APP"
           codesign --verify --verbose "$APP"
+          echo "签名身份要求（钥匙串按这个记住授权）："
+          codesign -d -r- "$APP" 2>&1 | grep designated || true
 
           STAGING=$(mktemp -d)
           cp -R "$APP" "$STAGING/"
