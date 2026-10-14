@@ -2571,12 +2571,53 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         updateOpenCodeDBWatcher()
         startFrontmostAppWatcher()
         startPowerObservers()
+        startModifierWatch()
         if mode == .launcher {
             // 启动时允许弹一次钥匙串授权（之后后台读取都不会再弹）
             ClaudeCredentials.allowPromptOnce()
         }
         refresh()
         restartTimers()
+    }
+
+    // MARK: 按 Command 等修饰键后恢复用量栏
+
+    /// 按下 Command / Shift / Option / Control 时，输入法（如搜狗）会弹出自己的 Touch Bar，
+    /// 把展开的用量栏挤掉；松开后它不会自己回来。这里检测修饰键松开，把用量栏恢复。
+    /// 只读取“修饰键是否按着”这一个状态（系统公开接口，不需要任何权限，不记录按了什么键）。
+    private var modifierTimer: Timer?
+    private var modifiersDown = false
+    private var restoreAfterModifiers = false
+
+    private var usageBarWanted: Bool {
+        ControlStrip.isSupported && !isSuspended && !musicAppActive
+            && AppConfig.shared.resolvedPlacement != .controlStripOnly
+    }
+
+    private func startModifierWatch() {
+        modifierTimer?.invalidate()
+        guard !isSuspended else { return }
+        modifierTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkModifiers() }
+        }
+        modifierTimer?.tolerance = 0.05
+    }
+
+    private func checkModifiers() {
+        let flags = CGEventSource.flagsState(.combinedSessionState)
+        let down = !flags.intersection([.maskCommand, .maskAlternate, .maskControl, .maskShift]).isEmpty
+        defer { modifiersDown = down }
+        if down && !modifiersDown {
+            // 按下时用量栏正在显示，才需要在松开后恢复（你自己点 ✕ 关掉的不会被重新打开）
+            restoreAfterModifiers = usageBarWanted && (touchBar.isVisible || AppConfig.shared.resolvedPlacement == .pinned)
+        } else if !down && modifiersDown && restoreAfterModifiers {
+            restoreAfterModifiers = false
+            // 等输入法把它的栏收起来再恢复
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                guard let self, self.usageBarWanted, !self.modifiersDown, !self.touchBar.isVisible else { return }
+                self.presentUsageBarAnimated()
+            }
+        }
     }
 
     // MARK: 睡眠 / 锁屏时暂停
@@ -2615,6 +2656,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         // 系统睡眠时，熄屏 / 锁屏的状态也会在唤醒时重新通知，这里一起记上
         if reason == "sleep" { suspendReasons.insert("display") }
         guard !wasSuspended else { return }
+        modifierTimer?.invalidate()
+        modifierTimer = nil
         timer?.invalidate()
         timer = nil
         pinTimer?.invalidate()
@@ -2633,6 +2676,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         }
         guard !isSuspended else { return }
         restartTimers()
+        startModifierWatch()
         if musicAppActive, AppConfig.shared.resolvedMusicMode == .iconOnly,
            AppConfig.shared.resolvedStripSlotPolicy != .never {
             startStripReclaimLoop()
@@ -2885,6 +2929,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         pinTimer?.invalidate()
         pinTimer = nil
         stopStripReclaimLoop()
+        modifierTimer?.invalidate()
+        modifierTimer = nil
         for (center, token) in powerObservers { center.removeObserver(token) }
         powerObservers.removeAll()
         if let appActivationObserver {
